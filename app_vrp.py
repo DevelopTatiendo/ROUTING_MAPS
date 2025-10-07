@@ -13,12 +13,16 @@ import streamlit as st
 import pandas as pd
 import folium
 from datetime import datetime
-from typing import Tuple, Optional
+from typing import Optional, Tuple
 
 from pre_procesamiento.prepro_visualizacion import (
     listar_ciudades_disponibles,
     cargar_geojson_comunas, 
-    listar_rutas_visualizacion
+    centro_ciudad,
+    listar_rutas_con_clientes
+)
+from pre_procesamiento.prepro_localizacion import (
+    dataset_visualizacion_por_ruta
 )
 
 # Configuración
@@ -34,101 +38,107 @@ def manejar_error(funcion, *args, **kwargs):
         st.error(f"❌ Error en {funcion.__name__}: {str(e)}")
         return None
 
-def generar_mapa_stub(ciudad: str, id_ruta: Optional[int] = None) -> Tuple[str, pd.DataFrame]:
+def _center_from_points(df):
+    """Helper para calcular centro desde puntos válidos"""
+    dfv = df.dropna(subset=['lat','lon'])
+    if not dfv.empty:
+        return [float(dfv['lat'].median()), float(dfv['lon'].median())]
+    return None
+
+
+def generar_mapa_clientes(ciudad: str, id_ruta: int, df: pd.DataFrame) -> Tuple[str, int, int, float]:
     """
-    Crea un mapa folium con la capa de comunas de la ciudad y devuelve:
-    - filename (str): nombre del HTML escrito en static/maps/
-    - df_export (pd.DataFrame): por ahora vacío, para el botón de descarga
+    Construye y guarda un HTML con:
+      - Mapa centrado en la ciudad o en el centroide de puntos válidos.
+      - Capa de comunas SIN popups/tooltips (solo estilo).
+      - Puntos negros simples (CircleMarker) solo para verificados.
+      - Popup mínimo: solo id_contacto.
+      - Leyenda fija con totales.
+    Retorna: (filename, total_clientes, con_coord, porcentaje)
     """
     try:
-        # Cargar GeoJSON de comunas
-        geojson_comunas = cargar_geojson_comunas(ciudad)
+        # Normalizar tipos (doble seguro)
+        df = df.copy()
+        for c in ['lat','lon']:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors='coerce')
+        df.loc[(df['lat']==0) | (df['lon']==0), ['lat','lon']] = None
+
+        # Calcular métricas
+        total = len(df)
+        dfv = df[(df['lat'].notna()) & (df['lon'].notna())].copy()
+        con_coord = len(dfv) 
+        pct = round((con_coord/total*100), 1) if total else 0.0
+
+        # Centro del mapa
+        center = _center_from_points(dfv) or centro_ciudad(ciudad)
+        zoom_start = 13 if con_coord > 0 else 12
         
-        # Coordenadas centro por ciudad
-        city_coords = {
-            "CALI": [3.4516, -76.5320],
-            "BOGOTA": [4.7110, -74.0721], 
-            "MEDELLIN": [6.2442, -75.5812],
-            "BARRANQUILLA": [10.9639, -74.7964],
-            "BUCARAMANGA": [7.1193, -73.1227],
-            "PEREIRA": [4.8133, -75.5961],
-            "MANIZALES": [5.0703, -75.5138]
-        }
+        # Crear mapa base con prefer_canvas para mejor rendimiento
+        m = folium.Map(location=center, zoom_start=zoom_start, prefer_canvas=True)
+
+        # Capa comunas (sin popups)
+        try:
+            fc = cargar_geojson_comunas(ciudad)
+            folium.GeoJson(
+                fc,
+                name="Comunas",
+                style_function=lambda f: {
+                    'fillColor':'#3388ff',
+                    'color':'#0066cc',
+                    'weight':1,
+                    'fillOpacity':0.08
+                }
+            ).add_to(m)
+            print(f"✅ Cargado GeoJSON de comunas para {ciudad}")
+        except Exception as e:
+            print(f"⚠️ Error cargando GeoJSON para {ciudad}: {e}")
+
+        # Puntos negros simples (solo verificados)
+        if con_coord > 0:
+            for _, r in dfv.iterrows():
+                folium.CircleMarker(
+                    location=[float(r['lat']), float(r['lon'])],
+                    radius=2,
+                    color='#111111',
+                    weight=0,              # sin borde
+                    fill=True,
+                    fill_color='#111111',
+                    fill_opacity=0.85,
+                    popup=str(int(r['id_contacto'])) if pd.notna(r['id_contacto']) else None
+                ).add_to(m)
+            
+            # Ajustar vista si hay puntos
+            if not dfv.empty:
+                m.fit_bounds([[dfv['lat'].min(), dfv['lon'].min()],
+                              [dfv['lat'].max(), dfv['lon'].max()]])
+
+        # Leyenda fija
+        legend_html = f"""
+        <div style="
+          position: fixed; top: 16px; right: 16px; z-index: 9999;
+          background: white; border: 1px solid #e5e7eb; border-radius: 8px;
+          box-shadow: 0 4px 12px rgba(0,0,0,.1); padding: 10px 12px; 
+          font-family: Inter, Arial; font-size: 12px">
+          <div style="font-weight:600; margin-bottom:6px;">Resumen</div>
+          <div>Total clientes: <b>{total}</b></div>
+          <div>Con coordenadas: <b>{con_coord}</b></div>
+          <div>% verificado: <b>{pct}%</b></div>
+        </div>"""
+        m.get_root().html.add_child(folium.Element(legend_html))
+
+        # Guardar
+        import time
+        os.makedirs("static/maps", exist_ok=True)
+        filename = f"vrp_{ciudad.lower()}_ruta{id_ruta}_{int(time.time())}.html"
+        m.save(f"static/maps/{filename}")
         
-        center_coords = city_coords.get(ciudad.upper(), [4.0, -74.0])
-        
-        # Crear mapa base
-        m = folium.Map(
-            location=center_coords,
-            zoom_start=11,
-            tiles='OpenStreetMap'
-        )
-        
-        # Agregar capa de comunas
-        folium.GeoJson(
-            geojson_comunas,
-            style_function=lambda feature: {
-                'fillColor': '#3388ff',
-                'color': '#0066cc',
-                'weight': 2,
-                'fillOpacity': 0.3
-            },
-            popup=folium.GeoJsonPopup(
-                fields=['nombre', 'id_comuna'],
-                aliases=['Comuna:', 'ID:'],
-                labels=True,
-                style="background-color: white;"
-            ),
-            tooltip=folium.GeoJsonTooltip(
-                fields=['nombre'],
-                aliases=['Comuna:'],
-                labels=True
-            )
-        ).add_to(m)
-        
-        # Marcador central con info
-        info_ruta = f" - Ruta {id_ruta}" if id_ruta else ""
-        folium.Marker(
-            center_coords,
-            popup=f"""
-            <div style="width: 220px;">
-                <h4>🚚 VRP - {ciudad}</h4>
-                <p><strong>Ciudad:</strong> {ciudad}{info_ruta}</p>
-                <p><strong>Comunas:</strong> {len(geojson_comunas.get('features', []))}</p>
-                <p style="font-style: italic; color: #666;">
-                    Mapa base - Sin datos de clientes aún
-                </p>
-            </div>
-            """,
-            tooltip=f"VRP {ciudad}",
-            icon=folium.Icon(color="blue", icon="map", prefix="fa")
-        ).add_to(m)
-        
-        # Generar nombre de archivo único
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        ruta_suffix = f"_ruta{id_ruta}" if id_ruta else ""
-        filename = f"vrp_{ciudad.lower()}_{timestamp}{ruta_suffix}.html"
-        
-        # Asegurar directorio
-        os.makedirs('static/maps', exist_ok=True)
-        
-        # Guardar mapa
-        filepath = os.path.join('static/maps', filename)
-        m.save(filepath)
-        
-        print(f"[VRP] Mapa generado: {filename}")
-        
-        # DataFrame stub para descarga futura
-        df_export = pd.DataFrame(columns=[
-            "id_contacto", "lat", "lon", "direccion", "ciudad", 
-            "id_ruta", "ruta", "fecha_generacion"
-        ])
-        
-        return filename, df_export
+        print(f"✅ Mapa guardado: {filename} ({con_coord}/{total} clientes con coordenadas)")
+        return filename, total, con_coord, pct
         
     except Exception as e:
-        print(f"[ERROR] Error generando mapa: {e}")
-        raise
+        print(f"❌ Error generando mapa: {e}")
+        return "", 0, 0, 0.0
 
 # === STREAMLIT UI ===
 st.set_page_config(
@@ -190,9 +200,9 @@ elif st.session_state["last_ciudad"] != ciudad_seleccionada:
 with st.form(key="vrp_form"):
     st.subheader("Seleccionar Ruta")
     
-    # Cargar rutas desde BD
+    # Cargar rutas desde BD con conteo real de clientes
     with st.spinner("Cargando rutas desde BD..."):
-        df_rutas = manejar_error(listar_rutas_visualizacion, ciudad_seleccionada)
+        df_rutas = manejar_error(listar_rutas_con_clientes, ciudad_seleccionada)
     
     if df_rutas is None or df_rutas.empty:
         st.warning(f"⚠️ No hay rutas disponibles para {ciudad_seleccionada} en la base de datos")
@@ -200,22 +210,30 @@ with st.form(key="vrp_form"):
         id_ruta_seleccionada = None
         nombre_ruta_seleccionada = None
     else:
-        st.success(f"✅ {len(df_rutas)} rutas encontradas")
+        # Mostrar estadísticas de rutas cargadas
+        total_rutas = len(df_rutas)
+        total_clientes = df_rutas['clientes_en_ruta'].sum()
+        st.success(f"✅ {total_rutas} rutas encontradas con {total_clientes} clientes totales")
         
-        # Crear selector de rutas
-        opciones_rutas = [""] + [f"{row.ruta} (ID: {row.id_ruta})" for _, row in df_rutas.iterrows()]
+        # Crear selector de rutas - solo mostrar nombre, ordenado A→Z
+        df_rutas_sorted = df_rutas.sort_values('nombre_ruta')
+        opciones_rutas = [""] + [f"{row.nombre_ruta} ({row.clientes_en_ruta} clientes)" for _, row in df_rutas_sorted.iterrows()]
+        
         ruta_seleccionada = st.selectbox(
-            "Ruta (opcional):",
+            "Ruta (obligatorio):",
             options=opciones_rutas,
-            help="Seleccione una ruta específica o deje vacío para ver todas las comunas"
+            help="Seleccione una ruta específica para visualizar sus clientes"
         )
         
         if ruta_seleccionada and ruta_seleccionada != "":
-            # Extraer ID de la opción seleccionada
-            selected_row = df_rutas[df_rutas.apply(lambda x: f"{x.ruta} (ID: {x.id_ruta})" == ruta_seleccionada, axis=1)]
+            # Extraer nombre de ruta de la opción seleccionada
+            nombre_ruta = ruta_seleccionada.split(" (")[0]  # Extraer solo el nombre antes de " (X clientes)"
+            selected_row = df_rutas_sorted[df_rutas_sorted['nombre_ruta'] == nombre_ruta]
             if not selected_row.empty:
                 id_ruta_seleccionada = int(selected_row.iloc[0]['id_ruta'])
-                nombre_ruta_seleccionada = selected_row.iloc[0]['ruta']
+                nombre_ruta_seleccionada = selected_row.iloc[0]['nombre_ruta']
+                clientes_en_ruta = selected_row.iloc[0]['clientes_en_ruta']
+                st.info(f"**Ruta seleccionada:** {nombre_ruta_seleccionada} con {clientes_en_ruta} clientes")
             else:
                 id_ruta_seleccionada = None
                 nombre_ruta_seleccionada = None
@@ -239,51 +257,83 @@ with st.form(key="vrp_form"):
 
 # === PROCESAMIENTO ===
 if generar_button:
-    with st.spinner("Generando mapa..."):
-        resultado = manejar_error(generar_mapa_stub, ciudad_seleccionada, id_ruta_seleccionada)
-        
-        if resultado and len(resultado) == 2:
-            filename, df_export = resultado
+    if not id_ruta_seleccionada:
+        st.error("❌ Seleccione una ruta para generar el mapa")
+    else:
+        with st.spinner("Cargando datos de clientes y coordenadas..."):
+            # Obtener dataset completo con coordenadas
+            df_dataset = manejar_error(dataset_visualizacion_por_ruta, id_ruta_seleccionada)
             
-            if filename:
-                # Guardar para descarga CSV
-                st.session_state["vrp_export_df"] = df_export
-                st.session_state["vrp_export_meta"] = {
-                    "ciudad": ciudad_seleccionada,
-                    "id_ruta": id_ruta_seleccionada,
-                    "nombre_ruta": nombre_ruta_seleccionada,
-                    "timestamp": datetime.now()
-                }
+            if df_dataset is not None and not df_dataset.empty:
+                # Estadísticas del dataset
+                total_clientes = len(df_dataset)
+                clientes_verificados = df_dataset['verificado'].sum()
+                porcentaje_verificado = (clientes_verificados / total_clientes * 100) if total_clientes > 0 else 0
                 
-                # URL con cache busting
-                timestamp = int(time.time())
-                map_url = f"{FLASK_SERVER}/maps/{filename}?t={timestamp}"
-                st.session_state["map_url"] = map_url
+                st.success(f"✅ Dataset cargado: {total_clientes} clientes, {clientes_verificados} con coordenadas ({porcentaje_verificado:.1f}%)")
                 
-                # Mostrar enlace
-                link_placeholder.success("✅ Mapa generado exitosamente!")
-                link_placeholder.markdown(
-                    f"""
-                    <div style="text-align: center; padding: 1rem;">
-                        <a href="{map_url}" target="_blank" rel="noopener" 
-                           style="
-                               display: inline-block; 
-                               padding: 12px 24px; 
-                               background: #0066cc; 
-                               color: white; 
-                               text-decoration: none; 
-                               border-radius: 8px; 
-                               font-weight: 600;
-                               box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-                           ">
-                            🗺️ Ver Mapa en Nueva Pestaña
-                        </a>
-                    </div>
-                    """, 
-                    unsafe_allow_html=True
-                )
+                # Generar mapa con datos reales
+                with st.spinner("Generando mapa con clientes..."):
+                    resultado = manejar_error(generar_mapa_clientes, ciudad_seleccionada, id_ruta_seleccionada, df_dataset)
+                    
+                    if resultado and len(resultado) == 4:
+                        filename, total_real, con_coord_real, porcentaje_real = resultado
+                        
+                        if filename:
+                            # Guardar dataset real para descarga CSV
+                            st.session_state["vrp_export_df"] = df_dataset
+                            st.session_state["vrp_export_meta"] = {
+                                "ciudad": ciudad_seleccionada,
+                                "id_ruta": id_ruta_seleccionada,
+                                "nombre_ruta": nombre_ruta_seleccionada,
+                                "timestamp": datetime.now(),
+                                "total_clientes": total_real,
+                                "clientes_verificados": con_coord_real
+                            }
+                            
+                            # URL con cache busting
+                            timestamp = int(time.time())
+                            map_url = f"{FLASK_SERVER}/maps/{filename}?t={timestamp}"
+                            st.session_state["map_url"] = map_url
+                            
+                            # Mostrar enlace y métricas
+                            link_placeholder.success("✅ Mapa generado exitosamente!")
+                            
+                            # Mostrar métricas en columnas (usar los valores reales del mapa)
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("Total Clientes", total_real)
+                            with col2:
+                                st.metric("Con Coordenadas", con_coord_real)
+                            with col3:
+                                st.metric("% Verificado", f"{porcentaje_real:.1f}%")
+                            
+                            link_placeholder.markdown(
+                                f"""
+                                <div style="text-align: center; padding: 1rem;">
+                                    <a href="{map_url}" target="_blank" rel="noopener" 
+                                       style="
+                                           display: inline-block; 
+                                           padding: 12px 24px; 
+                                           background: #0066cc; 
+                                           color: white; 
+                                           text-decoration: none; 
+                                           border-radius: 8px; 
+                                           font-weight: 600;
+                                           box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                                       ">
+                                        🗺️ Ver Mapa en Nueva Pestaña
+                                    </a>
+                                </div>
+                                """, 
+                                unsafe_allow_html=True
+                            )
+                        else:
+                            st.error("❌ No se pudo generar el mapa")
+                    else:
+                        st.error("❌ Error generando el mapa")
             else:
-                st.error("❌ No se pudo generar el mapa")
+                st.error("❌ No se pudieron cargar los datos de la ruta")
 
 # Mostrar enlace persistente si existe
 if "map_url" in st.session_state and st.session_state["map_url"] and not generar_button:
@@ -315,15 +365,34 @@ st.subheader("📥 Exportar Datos")
 df_export = st.session_state.get("vrp_export_df")
 export_meta = st.session_state.get("vrp_export_meta")
 
-if df_export is not None and export_meta is not None:
-    # Por ahora siempre vacío (stub), pero preparado para datos reales
+if df_export is not None and not df_export.empty and export_meta is not None:
+    # Generar CSV con datos reales
+    from datetime import datetime
+    
+    ciudad_clean = export_meta["ciudad"].lower().replace(" ", "_")
+    fecha_str = export_meta["timestamp"].strftime("%Y%m%d_%H%M%S")
+    filename_csv = f"vrp_clientes_{ciudad_clean}_ruta{export_meta['id_ruta']}_{fecha_str}.csv"
+    
+    # Preparar DataFrame para descarga
+    df_csv = df_export.copy()
+    
+    # Formatear fecha_evento si existe
+    if 'fecha_evento' in df_csv.columns:
+        df_csv['fecha_evento'] = pd.to_datetime(df_csv['fecha_evento'], errors='coerce').dt.strftime('%Y-%m-%d %H:%M:%S')
+    
+    # CSV con encoding UTF-8-SIG para Excel
+    csv_data = df_csv.to_csv(index=False, sep=';').encode('utf-8-sig')
+    
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
-        st.button(
-            "📥 Descargar CSV (datos mostrados)",
-            disabled=True,
+        st.download_button(
+            label=f"📥 Descargar CSV ({len(df_export)} registros)",
+            data=csv_data,
+            file_name=filename_csv,
+            mime="text/csv",
+            type="secondary",
             use_container_width=True,
-            help="Funcionalidad preparada para datos reales de clientes/rutas"
+            help=f"Descarga datos de {export_meta.get('total_clientes', len(df_export))} clientes, {export_meta.get('clientes_verificados', 0)} con coordenadas"
         )
 else:
     col1, col2, col3 = st.columns([1, 2, 1])
@@ -344,13 +413,21 @@ with col1:
     st.info(f"**🏙️ Ciudades:** {len(ciudades_disponibles)}")
     
 with col2:
-    if df_rutas is not None:
+    if df_rutas is not None and not df_rutas.empty:
+        total_clientes_sistema = df_rutas['clientes_en_ruta'].sum()
         st.info(f"**🛣️ Rutas ({ciudad_seleccionada}):** {len(df_rutas)}")
+        st.info(f"**👥 Clientes totales:** {total_clientes_sistema}")
     else:
         st.info("**🛣️ Rutas:** No disponibles")
         
 with col3:
-    st.info("**📊 Datos:** Stub (sin clientes aún)")
+    export_meta = st.session_state.get("vrp_export_meta")
+    if export_meta:
+        verificados = export_meta.get('clientes_verificados', 0)
+        total = export_meta.get('total_clientes', 0)
+        st.info(f"**� Verificados:** {verificados}/{total}")
+    else:
+        st.info("**📊 Datos:** Seleccione ruta")
 
 with st.expander("🔧 Información Técnica"):
     st.markdown(f"""

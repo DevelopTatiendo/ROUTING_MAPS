@@ -16,6 +16,25 @@ from dotenv import load_dotenv
 # Cargar variables de entorno
 load_dotenv()
 
+# Configuración de ciudades con centros y geojson
+CITY_CFG = {
+    'CALI': {
+        'center': [3.4516, -76.5320], 
+        'geojson': 'geojson/cali_comunas.geojson', 
+        'id_centroope': 2
+    },
+    'BOGOTA': {
+        'center': [4.7110, -74.0721], 
+        'geojson': 'geojson/bogota_comunas.geojson', 
+        'id_centroope': 1
+    },
+    'MEDELLIN': {
+        'center': [6.2442, -75.5812], 
+        'geojson': 'geojson/medellin_comunas.geojson', 
+        'id_centroope': 3
+    }
+}
+
 # Mapping ciudad → código para filtrar en BD (reutilizando lógica de consultores)
 CIUDAD_CO_MAP = {
     'CALI': '2',
@@ -148,3 +167,124 @@ def listar_rutas_visualizacion(ciudad: str) -> pd.DataFrame:
         print(f"[ERROR] Error consultando rutas para {ciudad}: {e}")
         # Retornar DataFrame vacío en caso de error
         return pd.DataFrame(columns=['id_ruta', 'ruta'])
+
+
+def listar_rutas_con_clientes(ciudad: str) -> pd.DataFrame:
+    """
+    Devuelve columnas: ['id_ruta','nombre_ruta','clientes_en_ruta'] para la ciudad.
+    Filtro de clientes: c.estado_cxc in (0,1) y c.estado = 1.
+    Orden: nombre_ruta asc.
+    """
+    # Obtener id_centroope de la ciudad
+    id_centroope = CIUDAD_CO_MAP.get(ciudad.upper())
+    if not id_centroope:
+        print(f"[WARNING] Ciudad {ciudad} no tiene mapping centroope definido. Retornando vacío.")
+        return pd.DataFrame(columns=['id_ruta', 'nombre_ruta', 'clientes_en_ruta'])
+    
+    try:
+        conn = _get_db_connection()
+        
+        # Query para obtener rutas con conteo real de clientes
+        query = """
+        SELECT
+            r.id   AS id_ruta,
+            r.ruta AS nombre_ruta,
+            COUNT(DISTINCT c.id) AS clientes_en_ruta
+        FROM fullclean_contactos.vwContactos c
+        JOIN fullclean_contactos.barrios b
+          ON b.id = c.id_barrio
+        JOIN fullclean_contactos.rutas_cobro_zonas rcz
+          ON rcz.id_barrio = b.id
+        JOIN fullclean_contactos.rutas_cobro r
+          ON r.id = rcz.id_ruta_cobro
+        WHERE r.id_centroope = %s
+          AND c.estado_cxc IN (0,1)
+          AND c.estado = 1
+        GROUP BY r.id, r.ruta
+        ORDER BY r.ruta
+        """
+        
+        df = pd.read_sql(query, conn, params=[id_centroope])
+        conn.close()
+        
+        print(f"[INFO] Cargadas {len(df)} rutas con clientes para {ciudad} (centro_ope={id_centroope})")
+        return df
+        
+    except Exception as e:
+        print(f"[ERROR] Error consultando rutas con clientes para {ciudad}: {e}")
+        # Retornar DataFrame vacío en caso de error
+        return pd.DataFrame(columns=['id_ruta', 'nombre_ruta', 'clientes_en_ruta'])
+
+
+def contactos_base_por_ruta(id_ruta: int) -> pd.DataFrame:
+    """
+    Devuelve al menos:
+    ['id_contacto','id_ruta','nombre_ruta','id_barrio'] (agrega lo que esté disponible: barrio, dirección...).
+    Filtro de clientes: c.estado_cxc in (0,1) y c.estado = 1.
+    """
+    try:
+        conn = _get_db_connection()
+        
+        # Query para obtener clientes base de la ruta
+        query = """
+        SELECT
+            c.id                  AS id_contacto,
+            r.id                  AS id_ruta,
+            r.ruta                AS nombre_ruta,
+            c.id_barrio,
+            b.barrio              AS nombre_barrio,
+            c.direccion_entrega   AS direccion,
+            c.ultima_compra       AS ultima_compra
+        FROM fullclean_contactos.vwContactos c
+        JOIN fullclean_contactos.barrios b
+          ON b.Id = c.id_barrio
+        JOIN fullclean_contactos.rutas_cobro_zonas rcz
+          ON rcz.id_barrio = b.Id
+        JOIN fullclean_contactos.rutas_cobro r
+          ON r.id = rcz.id_ruta_cobro
+        WHERE r.id = %s
+          AND c.estado_cxc IN (0,1)
+          AND c.estado = 1
+        """
+        
+        df = pd.read_sql(query, conn, params=[int(id_ruta)])
+        conn.close()
+        
+        print(f"[INFO] Cargados {len(df)} contactos base para ruta {id_ruta}")
+        return df
+        
+    except Exception as e:
+        print(f"[ERROR] Error consultando contactos base para ruta {id_ruta}: {e}")
+        # Retornar DataFrame vacío en caso de error
+        return pd.DataFrame(columns=['id_contacto', 'id_ruta', 'nombre_ruta', 'id_barrio', 'nombre_barrio', 'direccion', 'ultima_compra'])
+
+
+def cargar_geojson_comunas(ciudad: str) -> dict:
+    """
+    Carga el archivo GeoJSON de comunas para la ciudad especificada
+    """
+    try:
+        config = CITY_CFG.get(ciudad.upper())
+        if not config:
+            raise ValueError(f"Ciudad {ciudad} no configurada")
+        
+        geojson_path = config['geojson']
+        
+        with open(geojson_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+            
+    except Exception as e:
+        print(f"[ERROR] Error cargando GeoJSON para {ciudad}: {e}")
+        raise
+
+
+def centro_ciudad(ciudad: str) -> List[float]:
+    """
+    Retorna las coordenadas del centro de la ciudad
+    """
+    config = CITY_CFG.get(ciudad.upper())
+    if not config:
+        # Default a Bogotá si no se encuentra la ciudad
+        return [4.7110, -74.0721]
+    
+    return config['center']
