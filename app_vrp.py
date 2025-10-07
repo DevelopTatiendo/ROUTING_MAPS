@@ -1,293 +1,361 @@
-from config.secrets_manager import load_env_secure
-load_env_secure(
-    prefer_plain=True,
-    enc_path="config/.env.enc", 
-    pass_env_var="MAPAS_SECRET_PASSPHRASE",
-    cache=False
-)
+"""
+VRP Visualización - Streamlit App Única
+Sistema mínimo para visualización de rutas con:
+- Selector de ciudad (detecta GeoJSON disponibles)
+- Selector de ruta (carga desde BD)
+- Generación de mapas stub con comunas
+"""
 
 import os
 import time
 import logging
-import re
 import streamlit as st
 import pandas as pd
-from ui_vrp import listar_rutas_simple, generar_mapa_stub
+import folium
+from datetime import datetime
+from typing import Tuple, Optional
 
-# Configuración de entorno
-ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
-FLASK_SERVER = os.getenv("FLASK_SERVER_URL", "http://localhost:5000") if ENVIRONMENT == "production" else "http://localhost:5000"
+from pre_procesamiento.prepro_visualizacion import (
+    listar_ciudades_disponibles,
+    cargar_geojson_comunas, 
+    listar_rutas_visualizacion
+)
 
-# Validación básica de URL (sin validators para simplificar dependencias)
-if not FLASK_SERVER.startswith("http://localhost") and not FLASK_SERVER.startswith("http://") and not FLASK_SERVER.startswith("https://"):
-    raise ValueError(f"❌ Error: `FLASK_SERVER_URL` no es una URL válida: {FLASK_SERVER}")
-
-print(f"🌍 Servidor activo en: {FLASK_SERVER} | Entorno: {ENVIRONMENT}")
-
-# Configuración de logs
+# Configuración
+FLASK_SERVER = "http://localhost:5000"
 logging.basicConfig(level=logging.ERROR, format="%(asctime)s - %(levelname)s - %(message)s", filename="errors.log")
 
 def manejar_error(funcion, *args, **kwargs):
-    """ Ejecuta una función y captura cualquier error. """
+    """Ejecuta una función y captura cualquier error"""
     try:
         return funcion(*args, **kwargs)
     except Exception as e:
         logging.error(f"Error en {funcion.__name__}: {str(e)}")
-        st.error(f"❌ Ocurrió un error en {funcion.__name__}. Revisa los logs.")
+        st.error(f"❌ Error en {funcion.__name__}: {str(e)}")
         return None
 
-# === UI STREAMLIT VRP MVP ===
-st.title("Gestor Visual de Ruteo — MVP")
+def generar_mapa_stub(ciudad: str, id_ruta: Optional[int] = None) -> Tuple[str, pd.DataFrame]:
+    """
+    Crea un mapa folium con la capa de comunas de la ciudad y devuelve:
+    - filename (str): nombre del HTML escrito en static/maps/
+    - df_export (pd.DataFrame): por ahora vacío, para el botón de descarga
+    """
+    try:
+        # Cargar GeoJSON de comunas
+        geojson_comunas = cargar_geojson_comunas(ciudad)
+        
+        # Coordenadas centro por ciudad
+        city_coords = {
+            "CALI": [3.4516, -76.5320],
+            "BOGOTA": [4.7110, -74.0721], 
+            "MEDELLIN": [6.2442, -75.5812],
+            "BARRANQUILLA": [10.9639, -74.7964],
+            "BUCARAMANGA": [7.1193, -73.1227],
+            "PEREIRA": [4.8133, -75.5961],
+            "MANIZALES": [5.0703, -75.5138]
+        }
+        
+        center_coords = city_coords.get(ciudad.upper(), [4.0, -74.0])
+        
+        # Crear mapa base
+        m = folium.Map(
+            location=center_coords,
+            zoom_start=11,
+            tiles='OpenStreetMap'
+        )
+        
+        # Agregar capa de comunas
+        folium.GeoJson(
+            geojson_comunas,
+            style_function=lambda feature: {
+                'fillColor': '#3388ff',
+                'color': '#0066cc',
+                'weight': 2,
+                'fillOpacity': 0.3
+            },
+            popup=folium.GeoJsonPopup(
+                fields=['nombre', 'id_comuna'],
+                aliases=['Comuna:', 'ID:'],
+                labels=True,
+                style="background-color: white;"
+            ),
+            tooltip=folium.GeoJsonTooltip(
+                fields=['nombre'],
+                aliases=['Comuna:'],
+                labels=True
+            )
+        ).add_to(m)
+        
+        # Marcador central con info
+        info_ruta = f" - Ruta {id_ruta}" if id_ruta else ""
+        folium.Marker(
+            center_coords,
+            popup=f"""
+            <div style="width: 220px;">
+                <h4>🚚 VRP - {ciudad}</h4>
+                <p><strong>Ciudad:</strong> {ciudad}{info_ruta}</p>
+                <p><strong>Comunas:</strong> {len(geojson_comunas.get('features', []))}</p>
+                <p style="font-style: italic; color: #666;">
+                    Mapa base - Sin datos de clientes aún
+                </p>
+            </div>
+            """,
+            tooltip=f"VRP {ciudad}",
+            icon=folium.Icon(color="blue", icon="map", prefix="fa")
+        ).add_to(m)
+        
+        # Generar nombre de archivo único
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ruta_suffix = f"_ruta{id_ruta}" if id_ruta else ""
+        filename = f"vrp_{ciudad.lower()}_{timestamp}{ruta_suffix}.html"
+        
+        # Asegurar directorio
+        os.makedirs('static/maps', exist_ok=True)
+        
+        # Guardar mapa
+        filepath = os.path.join('static/maps', filename)
+        m.save(filepath)
+        
+        print(f"[VRP] Mapa generado: {filename}")
+        
+        # DataFrame stub para descarga futura
+        df_export = pd.DataFrame(columns=[
+            "id_contacto", "lat", "lon", "direccion", "ciudad", 
+            "id_ruta", "ruta", "fecha_generacion"
+        ])
+        
+        return filename, df_export
+        
+    except Exception as e:
+        print(f"[ERROR] Error generando mapa: {e}")
+        raise
 
-# Sidebar con ciudades
-st.sidebar.header("Configuración")
-ciudades = ["Barranquilla", "Bogotá", "Bucaramanga", "Cali", "Manizales", "Medellín", "Pereira"]
-ciudad = st.sidebar.radio("Ciudad:", ciudades, index=3)  # Cali por defecto
+# === STREAMLIT UI ===
+st.set_page_config(
+    page_title="VRP Visualización",
+    page_icon="🚚",
+    layout="wide"
+)
 
-# Tipo de mapa fijo para VRP
-st.header("Visualización")
-st.info("**Tipo:** Ruteo VRP (Vehicle Routing Problem)")
+st.title("🚚 VRP - Sistema de Visualización de Rutas")
 
-# Limpiar URL del mapa si cambia la ciudad
-current_selection = f"{ciudad}_VRP"
-if "last_selection" not in st.session_state:
-    st.session_state["last_selection"] = current_selection
-elif st.session_state["last_selection"] != current_selection:
+# === SIDEBAR: CONFIGURACIÓN ===
+st.sidebar.header("📍 Configuración")
+
+# Selector de ciudad (dinámico desde geojson)
+ciudades_disponibles = manejar_error(listar_ciudades_disponibles)
+if not ciudades_disponibles:
+    st.sidebar.error("❌ No se encontraron ciudades con GeoJSON disponibles")
+    st.stop()
+
+# Hacer default CALI si está disponible
+default_idx = 0
+if 'CALI' in ciudades_disponibles:
+    default_idx = ciudades_disponibles.index('CALI')
+
+ciudad_seleccionada = st.sidebar.selectbox(
+    "Ciudad:",
+    options=ciudades_disponibles,
+    index=default_idx,
+    help="Ciudades detectadas automáticamente desde /geojson/"
+)
+
+st.sidebar.markdown("---")
+
+# === MAIN: FORMULARIO ===
+st.header("🗺️ Generación de Mapas")
+
+# Información de la ciudad seleccionada
+col1, col2 = st.columns([2, 1])
+with col1:
+    st.info(f"**Ciudad seleccionada:** {ciudad_seleccionada}")
+with col2:
+    # Mostrar estado de GeoJSON
+    try:
+        geojson_data = cargar_geojson_comunas(ciudad_seleccionada)
+        num_comunas = len(geojson_data.get('features', []))
+        st.metric("Comunas", num_comunas)
+    except Exception as e:
+        st.error(f"Error GeoJSON: {e}")
+
+# Limpiar estado si cambia la ciudad
+if "last_ciudad" not in st.session_state:
+    st.session_state["last_ciudad"] = ciudad_seleccionada
+elif st.session_state["last_ciudad"] != ciudad_seleccionada:
     st.session_state["map_url"] = None
-    st.session_state["last_selection"] = current_selection
+    st.session_state["vrp_export_df"] = None
+    st.session_state["last_ciudad"] = ciudad_seleccionada
 
-# Formulario de filtros
+# Formulario principal
 with st.form(key="vrp_form"):
-    # Cargar rutas disponibles
-    df_rutas = listar_rutas_simple(ciudad)
+    st.subheader("Seleccionar Ruta")
+    
+    # Cargar rutas desde BD
+    with st.spinner("Cargando rutas desde BD..."):
+        df_rutas = manejar_error(listar_rutas_visualizacion, ciudad_seleccionada)
     
     if df_rutas is None or df_rutas.empty:
-        st.warning("No hay rutas disponibles para la ciudad seleccionada.")
-        ruta_options = []
-        id_ruta = None
-        nombre_ruta_ui = None
+        st.warning(f"⚠️ No hay rutas disponibles para {ciudad_seleccionada} en la base de datos")
+        ruta_seleccionada = None
+        id_ruta_seleccionada = None
+        nombre_ruta_seleccionada = None
     else:
-        # Ordenar rutas (extraer número si existe para ordenar numéricamente)
-        rutas_list = []
-        for _, r in df_rutas.iterrows():
-            ruta_nombre = str(r.ruta)
-            match = re.match(r'^(\d+)', ruta_nombre)
-            num = int(match.group()) if match else None
-            rutas_list.append((int(r.id_ruta), ruta_nombre, num))
+        st.success(f"✅ {len(df_rutas)} rutas encontradas")
         
-        # Ordenar: primero rutas numéricas (desc), luego alfanuméricas (desc)
-        rutas_list.sort(key=lambda x: (0 if x[2] is not None else 1, -x[2] if x[2] is not None else 0, x[1].upper()), reverse=True)
+        # Crear selector de rutas
+        opciones_rutas = [""] + [f"{row.ruta} (ID: {row.id_ruta})" for _, row in df_rutas.iterrows()]
+        ruta_seleccionada = st.selectbox(
+            "Ruta (opcional):",
+            options=opciones_rutas,
+            help="Seleccione una ruta específica o deje vacío para ver todas las comunas"
+        )
         
-        # Crear opciones para el selector
-        options_dict = {ruta_nombre: id_ruta for id_ruta, ruta_nombre, _ in rutas_list}
-        options_list = [ruta_nombre for _, ruta_nombre, _ in rutas_list]
-        
-        ruta_seleccionada = st.selectbox("Seleccione una ruta (obligatorio):", options=[""] + options_list)
-        id_ruta = options_dict.get(ruta_seleccionada) if ruta_seleccionada else None
-        nombre_ruta_ui = ruta_seleccionada if ruta_seleccionada else None
+        if ruta_seleccionada and ruta_seleccionada != "":
+            # Extraer ID de la opción seleccionada
+            selected_row = df_rutas[df_rutas.apply(lambda x: f"{x.ruta} (ID: {x.id_ruta})" == ruta_seleccionada, axis=1)]
+            if not selected_row.empty:
+                id_ruta_seleccionada = int(selected_row.iloc[0]['id_ruta'])
+                nombre_ruta_seleccionada = selected_row.iloc[0]['ruta']
+            else:
+                id_ruta_seleccionada = None
+                nombre_ruta_seleccionada = None
+        else:
+            id_ruta_seleccionada = None
+            nombre_ruta_seleccionada = None
     
-    # Fechas obligatorias
-    col1, col2 = st.columns(2)
-    with col1:
-        fecha_inicio = st.date_input("Fecha de Inicio")
+    st.markdown("---")
+    
+    # Botón generar
+    col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
-        fecha_fin = st.date_input("Fecha de Fin")
+        generar_button = st.form_submit_button(
+            "🗺️ Generar Mapa",
+            use_container_width=True,
+            type="primary"
+        )
     
-    # Botón para generar
-    col1, col2, col3 = st.columns([1, 1, 1])
-    with col2:
-        submit_button = st.form_submit_button("Generar Mapa", use_container_width=True, type="primary")
-    
-    # Placeholder para el enlace del mapa
+    # Placeholder para enlace
     link_placeholder = st.empty()
 
-# Botón de descarga CSV (fuera del form para mantener estado)
+# === PROCESAMIENTO ===
+if generar_button:
+    with st.spinner("Generando mapa..."):
+        resultado = manejar_error(generar_mapa_stub, ciudad_seleccionada, id_ruta_seleccionada)
+        
+        if resultado and len(resultado) == 2:
+            filename, df_export = resultado
+            
+            if filename:
+                # Guardar para descarga CSV
+                st.session_state["vrp_export_df"] = df_export
+                st.session_state["vrp_export_meta"] = {
+                    "ciudad": ciudad_seleccionada,
+                    "id_ruta": id_ruta_seleccionada,
+                    "nombre_ruta": nombre_ruta_seleccionada,
+                    "timestamp": datetime.now()
+                }
+                
+                # URL con cache busting
+                timestamp = int(time.time())
+                map_url = f"{FLASK_SERVER}/maps/{filename}?t={timestamp}"
+                st.session_state["map_url"] = map_url
+                
+                # Mostrar enlace
+                link_placeholder.success("✅ Mapa generado exitosamente!")
+                link_placeholder.markdown(
+                    f"""
+                    <div style="text-align: center; padding: 1rem;">
+                        <a href="{map_url}" target="_blank" rel="noopener" 
+                           style="
+                               display: inline-block; 
+                               padding: 12px 24px; 
+                               background: #0066cc; 
+                               color: white; 
+                               text-decoration: none; 
+                               border-radius: 8px; 
+                               font-weight: 600;
+                               box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                           ">
+                            🗺️ Ver Mapa en Nueva Pestaña
+                        </a>
+                    </div>
+                    """, 
+                    unsafe_allow_html=True
+                )
+            else:
+                st.error("❌ No se pudo generar el mapa")
+
+# Mostrar enlace persistente si existe
+if "map_url" in st.session_state and st.session_state["map_url"] and not generar_button:
+    link_placeholder.markdown(
+        f"""
+        <div style="text-align: center; padding: 1rem;">
+            <a href="{st.session_state['map_url']}" target="_blank" rel="noopener" 
+               style="
+                   display: inline-block; 
+                   padding: 12px 24px; 
+                   background: #0066cc; 
+                   color: white; 
+                   text-decoration: none; 
+                   border-radius: 8px; 
+                   font-weight: 600;
+                   box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+               ">
+                🗺️ Ver Mapa en Nueva Pestaña
+            </a>
+        </div>
+        """, 
+        unsafe_allow_html=True
+    )
+
+# === DESCARGA CSV ===
+st.markdown("---")
+st.subheader("📥 Exportar Datos")
+
 df_export = st.session_state.get("vrp_export_df")
 export_meta = st.session_state.get("vrp_export_meta")
 
-if df_export is not None and not df_export.empty and export_meta is not None:
-    # Generar nombre del archivo CSV
-    from datetime import datetime
-    
-    ciudad_csv = re.sub(r'[^A-Za-z0-9]', '', export_meta["ciudad"].upper())
-    fecha_ini_str = export_meta["fecha_inicio"].strftime("%Y%m%d")
-    fecha_fin_str = export_meta["fecha_fin"].strftime("%Y%m%d")
-    timestamp = datetime.now().strftime("%H%M%S")
-    
-    filename_csv = f"vrp_{ciudad_csv.lower()}_{export_meta['id_ruta']}_{fecha_ini_str}-{fecha_fin_str}_{timestamp}.csv"
-    
-    # Generar CSV con encoding UTF-8-SIG para Excel
-    csv_data = df_export.to_csv(index=False, sep=';').encode('utf-8-sig')
-    
-    col1, col2, col3 = st.columns([1, 1, 1])
-    with col2:
-        st.download_button(
-            label="📥 Descargar CSV (datos mostrados)",
-            data=csv_data,
-            file_name=filename_csv,
-            mime="text/csv",
-            type="secondary",
-            use_container_width=True,
-            help=f"Descarga {len(df_export)} registros mostrados en el mapa"
-        )
-else:
-    col1, col2, col3 = st.columns([1, 1, 1])
+if df_export is not None and export_meta is not None:
+    # Por ahora siempre vacío (stub), pero preparado para datos reales
+    col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         st.button(
             "📥 Descargar CSV (datos mostrados)",
             disabled=True,
-            type="secondary",
             use_container_width=True,
-            help="No hay datos para descargar. Genere primero un mapa exitoso."
+            help="Funcionalidad preparada para datos reales de clientes/rutas"
+        )
+else:
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.button(
+            "📥 Descargar CSV (datos mostrados)",
+            disabled=True,
+            use_container_width=True,
+            help="Genere primero un mapa para habilitar la descarga"
         )
 
-# === PROCESAMIENTO DEL FORMULARIO ===
-if submit_button:
-    try:
-        # Validaciones
-        if not id_ruta:
-            st.error("❌ Seleccione una ruta válida.")
-        elif fecha_inicio > fecha_fin:
-            st.error("❌ La fecha de inicio debe ser anterior o igual a la fecha de fin.")
-        else:
-            # Generar mapa stub
-            resultado = manejar_error(generar_mapa_stub, ciudad, id_ruta, nombre_ruta_ui, fecha_inicio, fecha_fin)
-            
-            if resultado and len(resultado) == 2:
-                filename, df_export = resultado
-                
-                if filename:
-                    # Guardar datos para exportación
-                    st.session_state["vrp_export_df"] = df_export
-                    st.session_state["vrp_export_meta"] = {
-                        "ciudad": ciudad,
-                        "id_ruta": id_ruta,
-                        "fecha_inicio": fecha_inicio,
-                        "fecha_fin": fecha_fin
-                    }
-                    
-                    # Mostrar enlace al mapa con cache-busting
-                    timestamp = int(time.time())
-                    map_url = f"{FLASK_SERVER}/maps/{filename}?t={timestamp}"
-                    st.session_state["map_url"] = map_url
-                    
-                    link_placeholder.markdown(
-                        f'<a href="{map_url}" target="_blank" rel="noopener" style="text-decoration:underline; color:#1d4ed8; font-weight:500;">🗺️ Ver Mapa en Nueva Pestaña</a>', 
-                        unsafe_allow_html=True
-                    )
-                    
-                    st.success("✅ Mapa generado exitosamente!")
-                else:
-                    st.error("❌ No se pudo generar el mapa.")
-                    st.session_state["vrp_export_df"] = None
-                    st.session_state["vrp_export_meta"] = None
-            else:
-                st.error("❌ Error en la generación del mapa.")
-                st.session_state["vrp_export_df"] = None
-                st.session_state["vrp_export_meta"] = None
-                
-    except Exception as e:
-        logging.error(f"❌ Error inesperado: {str(e)}")
-        st.error("⚠️ Se produjo un error inesperado. Revisa los logs.")
-
-# Mostrar enlace persistente si existe en session state
-if "map_url" in st.session_state and st.session_state["map_url"] is not None:
-    if not submit_button:  # Solo mostrar si no acabamos de procesar (evita duplicación)
-        link_placeholder.markdown(
-            f'<a href="{st.session_state["map_url"]}" target="_blank" rel="noopener" style="text-decoration:underline; color:#1d4ed8; font-weight:500;">🗺️ Ver Mapa en Nueva Pestaña</a>', 
-            unsafe_allow_html=True
-        )
-elif not submit_button:
-    link_placeholder.empty()
-
-# === INFO ADICIONAL ===
+# === FOOTER INFO ===
 st.markdown("---")
-st.markdown("### ℹ️ Información del MVP")
-st.info("""
-**Estado actual:** MVP sin datos reales  
-**Funcionalidad:** Interfaz de usuario completa con mapa placeholder  
-**Próximos pasos:** Integración con motor de ruteo y datos reales
-""")
+st.markdown("### ℹ️ Estado del Sistema")
+col1, col2, col3 = st.columns(3)
 
-# Card para editor de cuadrantes (mantenido del diseño original)
-ciudad_normalizada = ciudad.upper().replace("Á", "A").replace("É", "E").replace("Í", "I").replace("Ó", "O").replace("Ú", "U")
-editor_url = f"{FLASK_SERVER}/editor/cuadrantes?city={ciudad_normalizada}"
+with col1:
+    st.info(f"**🏙️ Ciudades:** {len(ciudades_disponibles)}")
+    
+with col2:
+    if df_rutas is not None:
+        st.info(f"**🛣️ Rutas ({ciudad_seleccionada}):** {len(df_rutas)}")
+    else:
+        st.info("**🛣️ Rutas:** No disponibles")
+        
+with col3:
+    st.info("**📊 Datos:** Stub (sin clientes aún)")
 
-st.markdown(
-    f"""
-    <style>
-    .card-cuadrantes {{
-        background: #fafafa;
-        border: 1px solid #e0e0e0;
-        border-radius: 12px;
-        padding: 1.5rem;
-        margin-top: 2rem;
-    }}
-    .card-cuadrantes h3 {{
-        color: #262730;
-        font-size: 1.2rem;
-        font-weight: 600;
-        margin: 0 0 0.5rem 0;
-    }}
-    .card-cuadrantes p {{
-        color: #6c757d;
-        font-size: 14px;
-        line-height: 1.4;
-        margin: 0 0 1.5rem 0;
-    }}
-    .cta-editor {{
-        display: inline-block;
-        padding: 12px 20px;
-        background: linear-gradient(135deg, #0EA5E9 0%, #2563EB 100%);
-        color: #FFFFFF;
-        text-decoration: none;
-        border-radius: 12px;
-        font-weight: 700;
-        font-size: 16px;
-        border: none;
-        cursor: pointer;
-        box-shadow: 0 4px 12px rgba(37, 99, 235, .25);
-        transition: all 0.3s ease;
-        text-align: center;
-        width: 100%;
-        max-width: 280px;
-    }}
-    .cta-editor:hover {{
-        color: #FFFFFF;
-        text-decoration: none;
-    }}
-    .cta-editor:focus {{
-        outline: 2px solid #2563EB;
-        outline-offset: 2px;
-        color: #FFFFFF;
-        text-decoration: none;
-    }}
-    @media (prefers-color-scheme: dark) {{
-        .card-cuadrantes {{
-            background: #2d3748;
-            border-color: #4a5568;
-        }}
-        .card-cuadrantes h3 {{
-            color: #f7fafc;
-        }}
-        .card-cuadrantes p {{
-            color: #a0aec0;
-        }}
-    }}
-    </style>
-    <div class="card-cuadrantes">
-        <h3>🗺️ Segmentación de ciudades</h3>
-        <p>Dibuje cuadrantes a base de polígonos para dividir áreas de interés en la ciudad seleccionada.</p>
-        <div style="text-align: center;">
-            <a href="{editor_url}" 
-               target="_blank" 
-               class="cta-editor"
-               aria-label="Abrir editor de cuadrantes para la ciudad seleccionada"
-               tabindex="0">
-                Abrir editor de cuadrantes
-            </a>
-        </div>
-    </div>
-    """, 
-    unsafe_allow_html=True
-)
+with st.expander("🔧 Información Técnica"):
+    st.markdown(f"""
+    - **Flask Server:** {FLASK_SERVER}
+    - **Ciudades detectadas:** {', '.join(ciudades_disponibles)}
+    - **BD Connection:** {'✅ Configurada' if os.getenv('DB_HOST') else '❌ Sin configurar'}
+    - **Próximos pasos:** Integración con datos reales de clientes y algoritmos VRP
+    """)
