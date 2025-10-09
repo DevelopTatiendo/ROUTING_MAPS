@@ -19,10 +19,18 @@ from pre_procesamiento.prepro_visualizacion import (
     listar_ciudades_disponibles,
     cargar_geojson_comunas, 
     centro_ciudad,
-    listar_rutas_con_clientes
+    listar_rutas_con_clientes,
+    contactos_base_por_ruta,
+    compute_metrics_localizacion
 )
 from pre_procesamiento.prepro_localizacion import (
-    dataset_visualizacion_por_ruta
+    dataset_visualizacion_por_ruta,
+    load_perimetro_from_geojson,
+    tag_in_perimetro,
+    fetch_top2_event_coords_for_ids,
+    apply_two_attempt_fix,
+    build_jobs_for_vrp,
+    SHAPELY_AVAILABLE
 )
 
 # Configuración
@@ -57,21 +65,26 @@ def generar_mapa_clientes(ciudad: str, id_ruta: int, df: pd.DataFrame) -> Tuple[
     Retorna: (filename, total_clientes, con_coord, porcentaje)
     """
     try:
-        # Normalizar tipos (doble seguro)
+        # Usar coordenadas finales si están disponibles, sino usar las originales
         df = df.copy()
-        for c in ['lat','lon']:
+        lon_col = 'lon_final' if 'lon_final' in df.columns else 'lon'
+        lat_col = 'lat_final' if 'lat_final' in df.columns else 'lat'
+        
+        # Normalizar tipos (doble seguro)
+        for c in [lon_col, lat_col]:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors='coerce')
-        df.loc[(df['lat']==0) | (df['lon']==0), ['lat','lon']] = None
+        df.loc[(df[lon_col]==0) | (df[lat_col]==0), [lon_col, lat_col]] = None
 
         # Calcular métricas
         total = len(df)
-        dfv = df[(df['lat'].notna()) & (df['lon'].notna())].copy()
+        dfv = df[(df[lon_col].notna()) & (df[lat_col].notna())].copy()
         con_coord = len(dfv) 
         pct = round((con_coord/total*100), 1) if total else 0.0
 
-        # Centro del mapa
-        center = _center_from_points(dfv) or centro_ciudad(ciudad)
+        # Centro del mapa (renombrar columnas temporalmente para _center_from_points)
+        dfv_temp = dfv.rename(columns={lon_col: 'lon', lat_col: 'lat'})
+        center = _center_from_points(dfv_temp) or centro_ciudad(ciudad)
         zoom_start = 13 if con_coord > 0 else 12
         
         # Crear mapa base con prefer_canvas para mejor rendimiento
@@ -98,7 +111,7 @@ def generar_mapa_clientes(ciudad: str, id_ruta: int, df: pd.DataFrame) -> Tuple[
         if con_coord > 0:
             for _, r in dfv.iterrows():
                 folium.CircleMarker(
-                    location=[float(r['lat']), float(r['lon'])],
+                    location=[float(r[lat_col]), float(r[lon_col])],
                     radius=2,
                     color='#111111',
                     weight=0,              # sin borde
@@ -110,8 +123,8 @@ def generar_mapa_clientes(ciudad: str, id_ruta: int, df: pd.DataFrame) -> Tuple[
             
             # Ajustar vista si hay puntos
             if not dfv.empty:
-                m.fit_bounds([[dfv['lat'].min(), dfv['lon'].min()],
-                              [dfv['lat'].max(), dfv['lon'].max()]])
+                m.fit_bounds([[dfv[lat_col].min(), dfv[lon_col].min()],
+                              [dfv[lat_col].max(), dfv[lon_col].max()]])
 
         # Leyenda fija
         legend_html = f"""
@@ -149,195 +162,215 @@ st.set_page_config(
 
 st.title("🚚 VRP - Sistema de Visualización de Rutas")
 
-# === SIDEBAR: CONFIGURACIÓN ===
-st.sidebar.header("📍 Configuración")
+# === SIDEBAR: CONFIGURACIÓN PILOTO ===
+st.sidebar.header("� VRP Piloto")
 
-# Selector de ciudad (dinámico desde geojson)
-ciudades_disponibles = manejar_error(listar_ciudades_disponibles)
-if not ciudades_disponibles:
-    st.sidebar.error("❌ No se encontraron ciudades con GeoJSON disponibles")
+# Verificar disponibilidad de librerías geoespaciales
+if not SHAPELY_AVAILABLE:
+    st.sidebar.error("❌ Librerías geoespaciales no instaladas")
+    st.sidebar.code("pip install shapely", language="bash")
     st.stop()
 
-# Hacer default CALI si está disponible
-default_idx = 0
-if 'CALI' in ciudades_disponibles:
-    default_idx = ciudades_disponibles.index('CALI')
+# Ciudad fija para el piloto
+ciudad_seleccionada = "CALI"
+st.sidebar.info(f"**Ciudad:** {ciudad_seleccionada} (fija para piloto)")
 
-ciudad_seleccionada = st.sidebar.selectbox(
-    "Ciudad:",
-    options=ciudades_disponibles,
-    index=default_idx,
-    help="Ciudades detectadas automáticamente desde /geojson/"
-)
+# Ruta piloto fija - ID 13 (Ruta 7)  
+id_ruta_piloto = 13
+nombre_ruta_piloto = "7"
+
+st.sidebar.info(f"**Ruta Piloto:** {nombre_ruta_piloto} (ID: {id_ruta_piloto})")
+st.sidebar.markdown("*Otras rutas deshabilitadas para piloto*")
+
+# Configuración del perímetro
+perimetro_file = "geojson/cali_perimetro_piloto.geojson"
+st.sidebar.success(f"**Perímetro:** cali_perimetro_piloto.geojson")
+
+# Variables para el procesamiento
+id_ruta_seleccionada = id_ruta_piloto  
+nombre_ruta_seleccionada = nombre_ruta_piloto
 
 st.sidebar.markdown("---")
 
-# === MAIN: FORMULARIO ===
-st.header("🗺️ Generación de Mapas")
+# === MAIN: PIPELINE VRP PILOTO ===
+st.header("� VRP Piloto - Etiquetado y Reparación")
 
-# Información de la ciudad seleccionada
+# Información del piloto
 col1, col2 = st.columns([2, 1])
 with col1:
-    st.info(f"**Ciudad seleccionada:** {ciudad_seleccionada}")
+    st.info(f"**Ruta Piloto:** {nombre_ruta_piloto} - {ciudad_seleccionada}")
 with col2:
-    # Mostrar estado de GeoJSON
     try:
-        geojson_data = cargar_geojson_comunas(ciudad_seleccionada)
-        num_comunas = len(geojson_data.get('features', []))
-        st.metric("Comunas", num_comunas)
-    except Exception as e:
-        st.error(f"Error GeoJSON: {e}")
-
-# Limpiar estado si cambia la ciudad
-if "last_ciudad" not in st.session_state:
-    st.session_state["last_ciudad"] = ciudad_seleccionada
-elif st.session_state["last_ciudad"] != ciudad_seleccionada:
-    st.session_state["map_url"] = None
-    st.session_state["vrp_export_df"] = None
-    st.session_state["last_ciudad"] = ciudad_seleccionada
+        if os.path.exists(perimetro_file):
+            st.metric("Perímetro", "✅ Disponible")
+        else:
+            st.metric("Perímetro", "❌ Faltante")
+    except Exception:
+        st.metric("Perímetro", "❌ Error")
 
 # Formulario principal
-with st.form(key="vrp_form"):
-    st.subheader("Seleccionar Ruta")
-    
-    # Cargar rutas desde BD con conteo real de clientes
-    with st.spinner("Cargando rutas desde BD..."):
-        df_rutas = manejar_error(listar_rutas_con_clientes, ciudad_seleccionada)
-    
-    if df_rutas is None or df_rutas.empty:
-        st.warning(f"⚠️ No hay rutas disponibles para {ciudad_seleccionada} en la base de datos")
-        ruta_seleccionada = None
-        id_ruta_seleccionada = None
-        nombre_ruta_seleccionada = None
-    else:
-        # Mostrar estadísticas de rutas cargadas
-        total_rutas = len(df_rutas)
-        total_clientes = df_rutas['clientes_en_ruta'].sum()
-        st.success(f"✅ {total_rutas} rutas encontradas con {total_clientes} clientes totales")
-        
-        # Crear selector de rutas - solo mostrar nombre, ordenado A→Z
-        df_rutas_sorted = df_rutas.sort_values('nombre_ruta')
-        opciones_rutas = [""] + [f"{row.nombre_ruta} ({row.clientes_en_ruta} clientes)" for _, row in df_rutas_sorted.iterrows()]
-        
-        ruta_seleccionada = st.selectbox(
-            "Ruta (obligatorio):",
-            options=opciones_rutas,
-            help="Seleccione una ruta específica para visualizar sus clientes"
-        )
-        
-        if ruta_seleccionada and ruta_seleccionada != "":
-            # Extraer nombre de ruta de la opción seleccionada
-            nombre_ruta = ruta_seleccionada.split(" (")[0]  # Extraer solo el nombre antes de " (X clientes)"
-            selected_row = df_rutas_sorted[df_rutas_sorted['nombre_ruta'] == nombre_ruta]
-            if not selected_row.empty:
-                id_ruta_seleccionada = int(selected_row.iloc[0]['id_ruta'])
-                nombre_ruta_seleccionada = selected_row.iloc[0]['nombre_ruta']
-                clientes_en_ruta = selected_row.iloc[0]['clientes_en_ruta']
-                st.info(f"**Ruta seleccionada:** {nombre_ruta_seleccionada} con {clientes_en_ruta} clientes")
-            else:
-                id_ruta_seleccionada = None
-                nombre_ruta_seleccionada = None
-        else:
-            id_ruta_seleccionada = None
-            nombre_ruta_seleccionada = None
-    
-    st.markdown("---")
-    
-    # Botón generar
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        generar_button = st.form_submit_button(
-            "🗺️ Generar Mapa",
-            use_container_width=True,
-            type="primary"
-        )
-    
-    # Placeholder para enlace
-    link_placeholder = st.empty()
+# Botón para ejecutar el pipeline
+procesar_button = st.button(
+    "🚛 Procesar Ruta Piloto",
+    use_container_width=True,
+    type="primary",
+    help="Ejecutar pipeline completo: etiquetado + reparación + mapa + export"
+)
 
-# === PROCESAMIENTO ===
-if generar_button:
-    if not id_ruta_seleccionada:
-        st.error("❌ Seleccione una ruta para generar el mapa")
-    else:
-        with st.spinner("Cargando datos de clientes y coordenadas..."):
-            # Obtener dataset completo con coordenadas
-            df_dataset = manejar_error(dataset_visualizacion_por_ruta, id_ruta_seleccionada)
+# === PIPELINE VRP PILOTO ===
+if procesar_button:
+    try:
+        # 1. CARGAR DATOS BASE
+        with st.spinner("1️⃣ Cargando contactos base de la ruta..."):
+            df_base = manejar_error(contactos_base_por_ruta, id_ruta_seleccionada)
             
-            if df_dataset is not None and not df_dataset.empty:
-                # Estadísticas del dataset
-                total_clientes = len(df_dataset)
-                clientes_verificados = df_dataset['verificado'].sum()
-                porcentaje_verificado = (clientes_verificados / total_clientes * 100) if total_clientes > 0 else 0
+            if df_base is None or df_base.empty:
+                st.error(f"❌ No se encontraron contactos para la ruta {id_ruta_seleccionada}")
+                st.stop()
+            
+            st.success(f"✅ {len(df_base)} contactos cargados desde BD")
+        
+        # 2. CARGAR PERÍMETRO
+        with st.spinner("2️⃣ Cargando perímetro GeoJSON..."):
+            try:
+                perimetro = load_perimetro_from_geojson(perimetro_file)
+                st.success("✅ Perímetro cargado y unificado")
+            except Exception as e:
+                st.error(f"❌ Error cargando perímetro: {e}")
+                st.stop()
+        
+        # 3. ETIQUETADO INICIAL
+        with st.spinner("3️⃣ Etiquetando puntos dentro del perímetro..."):
+            # Preparar DataFrame con coordenadas renombradas
+            df_work = df_base.copy()
+            
+            # Obtener coordenadas iniciales para los contactos
+            contact_ids = [int(x) for x in df_work['id_contacto'].unique()]
+            df_coords = fetch_top2_event_coords_for_ids(contact_ids)
+            
+            # Hacer merge para obtener coordenadas
+            df_merged = df_work.merge(
+                df_coords.groupby('id_contacto').first().reset_index(),
+                on='id_contacto', 
+                how='left'
+            )
+            
+            # Renombrar columnas para usar con el pipeline
+            df_merged = df_merged.rename(columns={
+                'coordenada_longitud': 'longitud',
+                'coordenada_latitud': 'latitud'
+            })
+            
+            # Reforzar tipos numéricos después del rename
+            for c in ('longitud', 'latitud'):
+                df_merged[c] = pd.to_numeric(df_merged[c], errors='coerce')
+            
+            # Debug: verificar tipos de datos
+            print(f"📊 Tipos de datos después de normalización:")
+            print(df_merged[['longitud','latitud']].dtypes)
+            
+            # Etiquetado inicial
+            df_tagged = tag_in_perimetro(df_merged, perimetro)
+            
+            dentro_inicial = df_tagged['in_poly_orig'].sum()
+            st.success(f"✅ Etiquetado inicial: {dentro_inicial}/{len(df_tagged)} dentro del perímetro")
+        
+        # 4. REPARACIÓN CON EVENTOS
+        with st.spinner("4️⃣ Reparando coordenadas con eventos adicionales..."):
+            # Identificar candidatos para reparación
+            mask_candidates = (
+                ~df_tagged['in_poly_orig'] | 
+                df_tagged['longitud'].isna() | 
+                df_tagged['latitud'].isna() |
+                (df_tagged['longitud'] == 0) |
+                (df_tagged['latitud'] == 0)
+            )
+            
+            candidatos = df_tagged[mask_candidates]['id_contacto'].unique().tolist()
+            
+            if candidatos:
+                # Obtener eventos para candidatos
+                df_events = fetch_top2_event_coords_for_ids(candidatos)
+                st.info(f"🔧 Procesando {len(candidatos)} candidatos con {len(df_events)} eventos")
                 
-                st.success(f"✅ Dataset cargado: {total_clientes} clientes, {clientes_verificados} con coordenadas ({porcentaje_verificado:.1f}%)")
-                
-                # Generar mapa con datos reales
-                with st.spinner("Generando mapa con clientes..."):
-                    resultado = manejar_error(generar_mapa_clientes, ciudad_seleccionada, id_ruta_seleccionada, df_dataset)
-                    
-                    if resultado and len(resultado) == 4:
-                        filename, total_real, con_coord_real, porcentaje_real = resultado
-                        
-                        if filename:
-                            # Guardar dataset real para descarga CSV
-                            st.session_state["vrp_export_df"] = df_dataset
-                            st.session_state["vrp_export_meta"] = {
-                                "ciudad": ciudad_seleccionada,
-                                "id_ruta": id_ruta_seleccionada,
-                                "nombre_ruta": nombre_ruta_seleccionada,
-                                "timestamp": datetime.now(),
-                                "total_clientes": total_real,
-                                "clientes_verificados": con_coord_real
-                            }
-                            
-                            # URL con cache busting
-                            timestamp = int(time.time())
-                            map_url = f"{FLASK_SERVER}/maps/{filename}?t={timestamp}"
-                            st.session_state["map_url"] = map_url
-                            
-                            # Mostrar enlace y métricas
-                            link_placeholder.success("✅ Mapa generado exitosamente!")
-                            
-                            # Mostrar métricas en columnas (usar los valores reales del mapa)
-                            col1, col2, col3 = st.columns(3)
-                            with col1:
-                                st.metric("Total Clientes", total_real)
-                            with col2:
-                                st.metric("Con Coordenadas", con_coord_real)
-                            with col3:
-                                st.metric("% Verificado", f"{porcentaje_real:.1f}%")
-                            
-                            link_placeholder.markdown(
-                                f"""
-                                <div style="text-align: center; padding: 1rem;">
-                                    <a href="{map_url}" target="_blank" rel="noopener" 
-                                       style="
-                                           display: inline-block; 
-                                           padding: 12px 24px; 
-                                           background: #0066cc; 
-                                           color: white; 
-                                           text-decoration: none; 
-                                           border-radius: 8px; 
-                                           font-weight: 600;
-                                           box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-                                       ">
-                                        🗺️ Ver Mapa en Nueva Pestaña
-                                    </a>
-                                </div>
-                                """, 
-                                unsafe_allow_html=True
-                            )
-                        else:
-                            st.error("❌ No se pudo generar el mapa")
-                    else:
-                        st.error("❌ Error generando el mapa")
+                # Aplicar reparación
+                df_final = apply_two_attempt_fix(df_tagged, df_events, perimetro)
             else:
-                st.error("❌ No se pudieron cargar los datos de la ruta")
+                df_final = df_tagged.copy()
+                df_final['lon_final'] = df_final['longitud']
+                df_final['lat_final'] = df_final['latitud']
+                df_final['coord_source'] = 'original'
+                df_final['in_poly_final'] = df_final['in_poly_orig']
+            
+            # 5. MÉTRICAS FINALES
+            metrics = compute_metrics_localizacion(df_final)
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Clientes", metrics['total_clientes'])
+            with col2:
+                st.metric("Con Coordenadas Iniciales", metrics['con_coordenadas_iniciales'])
+            with col3:
+                st.metric("% Dentro Cuadrante", f"{metrics['pct_dentro_cuadrante']}%")
+            
+            st.success(f"✅ Pipeline completado: {metrics['dentro_cuadrante']} clientes dentro del perímetro")
+        
+        # 6. GENERAR MAPA
+        with st.spinner("5️⃣ Generando mapa con puntos negros..."):
+            filename, total, con_coord, pct = generar_mapa_clientes(ciudad_seleccionada, id_ruta_seleccionada, df_final)
+            
+            if filename:
+                map_url = f"{FLASK_SERVER}/maps/{filename}?t={int(time.time())}"
+                st.session_state["map_url"] = map_url
+                st.session_state["vrp_dataset_final"] = df_final
+                
+                st.markdown(
+                    f"""
+                    <div style="text-align: center; padding: 1rem;">
+                        <a href="{map_url}" target="_blank" rel="noopener" 
+                           style="
+                               display: inline-block; 
+                               padding: 12px 24px; 
+                               background: #0066cc; 
+                               color: white; 
+                               text-decoration: none; 
+                               border-radius: 8px; 
+                               font-weight: 600;
+                               box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                           ">
+                            🗺️ Ver Mapa VRP Piloto
+                        </a>
+                    </div>
+                    """, 
+                    unsafe_allow_html=True
+                )
+            else:
+                st.error("❌ Error generando mapa")
+        
+        # 7. GENERAR JOBS PARA VRP
+        with st.spinner("6️⃣ Generando jobs VRP..."):
+            jobs_df = build_jobs_for_vrp(df_final)
+            
+            if not jobs_df.empty:
+                # Guardar archivo CSV
+                os.makedirs("data/inputs", exist_ok=True)
+                jobs_file = f"data/inputs/jobs_ruta{id_ruta_seleccionada}.csv"
+                jobs_df.to_csv(jobs_file, index=False)
+                
+                st.session_state["vrp_jobs_df"] = jobs_df
+                st.session_state["vrp_jobs_file"] = jobs_file
+                
+                st.success(f"✅ {len(jobs_df)} jobs generados y guardados en {jobs_file}")
+            else:
+                st.warning("⚠️ No se generaron jobs (sin clientes dentro del perímetro)")
+                
+    except Exception as e:
+        st.error(f"❌ Error en pipeline: {e}")
+        st.exception(e)
 
-# Mostrar enlace persistente si existe
-if "map_url" in st.session_state and st.session_state["map_url"] and not generar_button:
-    link_placeholder.markdown(
+# Mostrar enlace persistente si existe  
+if "map_url" in st.session_state and st.session_state["map_url"]:
+    st.markdown(
         f"""
         <div style="text-align: center; padding: 1rem;">
             <a href="{st.session_state['map_url']}" target="_blank" rel="noopener" 
@@ -351,12 +384,43 @@ if "map_url" in st.session_state and st.session_state["map_url"] and not generar
                    font-weight: 600;
                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
                ">
-                🗺️ Ver Mapa en Nueva Pestaña
+                🗺️ Ver Mapa VRP Piloto
             </a>
         </div>
         """, 
         unsafe_allow_html=True
     )
+
+# === EXPORTAR JOBS VRP ===
+if "vrp_jobs_df" in st.session_state and st.session_state["vrp_jobs_df"] is not None:
+    st.markdown("---")
+    st.subheader("📤 Exportar Jobs VRP")
+    
+    jobs_df = st.session_state["vrp_jobs_df"]
+    
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        st.metric("Jobs Generados", len(jobs_df))
+    with col2:
+        st.metric("Dentro del Perímetro", f"{len(jobs_df)} clientes")
+    
+    # Mostrar muestra de jobs
+    with st.expander("📋 Ver muestra de jobs"):
+        st.dataframe(jobs_df.head(10), use_container_width=True)
+    
+    # Preparar CSV para descarga
+    csv_data = jobs_df.to_csv(index=False).encode('utf-8')
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.download_button(
+            label=f"📥 Descargar jobs_ruta{id_ruta_piloto}.csv",
+            data=csv_data,
+            file_name=f"jobs_ruta{id_ruta_piloto}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            help=f"Descarga {len(jobs_df)} jobs listos para el solver VRP"
+        )
 
 # === DESCARGA CSV ===
 st.markdown("---")
@@ -410,15 +474,15 @@ st.markdown("### ℹ️ Estado del Sistema")
 col1, col2, col3 = st.columns(3)
 
 with col1:
-    st.info(f"**🏙️ Ciudades:** {len(ciudades_disponibles)}")
+    st.info(f"**🏙️ Ciudades:** 1 (CALI - piloto)")
     
 with col2:
-    if df_rutas is not None and not df_rutas.empty:
-        total_clientes_sistema = df_rutas['clientes_en_ruta'].sum()
-        st.info(f"**🛣️ Rutas ({ciudad_seleccionada}):** {len(df_rutas)}")
-        st.info(f"**👥 Clientes totales:** {total_clientes_sistema}")
+    st.info(f"**🛣️ Ruta Piloto:** {nombre_ruta_piloto}")
+    jobs_count = len(st.session_state.get("vrp_jobs_df", []))
+    if jobs_count > 0:
+        st.info(f"**� Jobs VRP:** {jobs_count}")
     else:
-        st.info("**🛣️ Rutas:** No disponibles")
+        st.info("**� Jobs VRP:** No generados")
         
 with col3:
     export_meta = st.session_state.get("vrp_export_meta")
@@ -432,7 +496,7 @@ with col3:
 with st.expander("🔧 Información Técnica"):
     st.markdown(f"""
     - **Flask Server:** {FLASK_SERVER}
-    - **Ciudades detectadas:** {', '.join(ciudades_disponibles)}
+    - **Ciudad piloto:** CALI
     - **BD Connection:** {'✅ Configurada' if os.getenv('DB_HOST') else '❌ Sin configurar'}
     - **Próximos pasos:** Integración con datos reales de clientes y algoritmos VRP
     """)

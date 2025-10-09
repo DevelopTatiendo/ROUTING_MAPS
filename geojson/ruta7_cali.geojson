@@ -1,0 +1,73 @@
+{
+  "type": "FeatureCollection",
+  "properties": {
+    "type": "full_dataset_export",
+    "city": "CALI",
+    "total_features": 1,
+    "registry_features": 1,
+    "export_timestamp": "2025-10-09T01:06:06.201Z",
+    "editor_version": "3.1",
+    "export_source": "ProjectRegistry + Visual Layers"
+  },
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "nivel": "cuadrante",
+        "codigo": "CL_1_01",
+        "ciudad": "CALI",
+        "id_ruta": "1",
+        "tipo": "PADRE",
+        "tipo_cuadrante": "RUTA",
+        "fillColor": "#FF97FF",
+        "fillOpacity": 0.35,
+        "weight": 2,
+        "color": "#000000",
+        "ruta_publica": "Ruta 1"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              -76.519504,
+              3.454106
+            ],
+            [
+              -76.518559,
+              3.4482
+            ],
+            [
+              -76.520105,
+              3.435701
+            ],
+            [
+              -76.520276,
+              3.433304
+            ],
+            [
+              -76.506883,
+              3.435444
+            ],
+            [
+              -76.499672,
+              3.4369
+            ],
+            [
+              -76.493662,
+              3.438269
+            ],
+            [
+              -76.486021,
+              3.452651
+            ],
+            [
+              -76.519504,
+              3.454106
+            ]
+          ]
+        ]
+      }
+    }
+  ]
+}

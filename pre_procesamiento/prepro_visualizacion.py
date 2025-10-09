@@ -10,7 +10,7 @@ import os
 import json
 import pandas as pd
 import mysql.connector
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 from dotenv import load_dotenv
 
 # Cargar variables de entorno
@@ -288,3 +288,33 @@ def centro_ciudad(ciudad: str) -> List[float]:
         return [4.7110, -74.0721]
     
     return config['center']
+
+
+def compute_metrics_localizacion(df: pd.DataFrame, total_col='id_contacto') -> Dict[str, Any]:
+    """
+    Calcula métricas de localización:
+    - total_clientes
+    - con_coordenadas_iniciales  
+    - %_dentro_cuadrante (con in_poly_final)
+    """
+    total_clientes = len(df)
+    
+    # Coordenadas iniciales válidas
+    mask_initial_coords = (
+        df.get('lat', pd.Series()).notna() & 
+        df.get('lon', pd.Series()).notna() &
+        (df.get('lat', pd.Series()) != 0) &
+        (df.get('lon', pd.Series()) != 0)
+    )
+    con_coordenadas_iniciales = mask_initial_coords.sum()
+    
+    # Dentro del cuadrante final
+    dentro_cuadrante = df.get('in_poly_final', pd.Series([False]*len(df))).sum()
+    pct_dentro_cuadrante = (dentro_cuadrante / total_clientes * 100) if total_clientes > 0 else 0.0
+    
+    return {
+        'total_clientes': int(total_clientes),
+        'con_coordenadas_iniciales': int(con_coordenadas_iniciales),
+        'dentro_cuadrante': int(dentro_cuadrante),
+        'pct_dentro_cuadrante': round(pct_dentro_cuadrante, 1)
+    }
