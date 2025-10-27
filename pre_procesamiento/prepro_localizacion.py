@@ -10,6 +10,7 @@ import pandas as pd
 import mysql.connector
 import json
 import os
+from pathlib import Path
 from typing import List, Dict, Any, Tuple
 from .prepro_visualizacion import _get_db_connection, contactos_base_por_ruta
 
@@ -449,3 +450,84 @@ def build_jobs_for_vrp(df: pd.DataFrame, service_sec_default: int = 600) -> pd.D
     
     print(f"✅ Generados {len(jobs_df)} jobs para VRP")
     return jobs_df
+
+
+# === FUNCIONES PARA CUADRANTE RUTA 7 ===
+
+def load_cuadrante_from_geojson(geojson_path: Path):
+    """
+    Lee un GeoJSON (FeatureCollection) y devuelve una única geometría (Polygon/MultiPolygon) unida y reparada.
+    - Aplica unary_union y buffer(0) para corregir geometrías con microgaps.
+    - Lanza FileNotFoundError si no existe.
+    """
+    if not SHAPELY_AVAILABLE:
+        raise ImportError("Shapely no está instalado. Use: pip install shapely")
+    
+    if not Path(geojson_path).exists():
+        raise FileNotFoundError(f"No existe el GeoJSON del cuadrante: {geojson_path}")
+
+    with open(geojson_path, "r", encoding="utf-8") as f:
+        gj = json.load(f)
+
+    geoms = [shape(feat["geometry"]) for feat in gj["features"]]
+    poly = unary_union(geoms).buffer(0)
+    
+    print(f"✅ Cuadrante cargado desde: {geojson_path}")
+    return poly
+
+
+def filtrar_dentro_cuadrante(
+    df: pd.DataFrame,
+    poly,
+    lat_col: str = "latitud",
+    lon_col: str = "longitud"
+):
+    """
+    Devuelve:
+      - df_inside: df con TODAS las columnas originales, sólo filas con coord válidas y dentro del polígono.
+      - df_outside: df con coord válidas pero fuera del polígono.
+      - kpis: dict con {'total', 'con_coord', 'sin_coord', 'dentro', 'fuera'}
+    Reglas:
+      - lat/lon se convierten a numérico con errors='coerce'
+      - 'coord válida' = lat ∈ [-90,90] y lon ∈ [-180,180] y no nulos
+    """
+    if not SHAPELY_AVAILABLE:
+        raise ImportError("Shapely no está instalado. Use: pip install shapely")
+    
+    df_loc = df.copy()
+    df_loc["_lat"] = pd.to_numeric(df_loc[lat_col], errors="coerce")
+    df_loc["_lon"] = pd.to_numeric(df_loc[lon_col], errors="coerce")
+
+    mask_valid = (
+        df_loc["_lat"].notna() & 
+        df_loc["_lon"].notna() &
+        df_loc["_lat"].between(-90, 90) & 
+        df_loc["_lon"].between(-180, 180)
+    )
+    
+    df_valid = df_loc[mask_valid].copy()
+    
+    # Evaluar puntos dentro del cuadrante
+    if len(df_valid) > 0:
+        df_valid["in_cuadrante"] = [
+            poly.contains(Point(lon, lat)) 
+            for lon, lat in zip(df_valid["_lon"], df_valid["_lat"])
+        ]
+        
+        df_inside = df_valid[df_valid["in_cuadrante"]].drop(columns=["_lat", "_lon", "in_cuadrante"])
+        df_outside = df_valid[~df_valid["in_cuadrante"]].drop(columns=["_lat", "_lon", "in_cuadrante"])
+    else:
+        df_inside = pd.DataFrame(columns=df.columns)
+        df_outside = pd.DataFrame(columns=df.columns)
+
+    kpis = {
+        "total": int(len(df_loc)),
+        "con_coord": int(len(df_valid)),
+        "sin_coord": int(len(df_loc) - len(df_valid)),
+        "dentro": int(len(df_inside)),
+        "fuera": int(len(df_outside)),
+    }
+    
+    print(f"✅ Filtrado cuadrante: {kpis['dentro']}/{kpis['total']} puntos dentro")
+    
+    return df_inside, df_outside, kpis

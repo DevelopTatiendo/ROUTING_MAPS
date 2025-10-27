@@ -5,6 +5,9 @@ Sistema mínimo para visualización de rutas con:
 - Selector de ruta (carga desde BD)
 - Generación de mapas stub con comunas
 """
+# Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+# .venv\Scripts\activate  python flask_server.py 
+# $env:MAPAS_SECRET_PASSPHRASE=
 
 import os
 import time
@@ -12,12 +15,12 @@ import logging
 import streamlit as st
 import pandas as pd
 import folium
+import io
 from datetime import datetime
 from typing import Optional, Tuple
 
 from pre_procesamiento.prepro_visualizacion import (
     listar_ciudades_disponibles,
-    cargar_geojson_comunas, 
     centro_ciudad,
     listar_rutas_con_clientes,
     contactos_base_por_ruta,
@@ -30,11 +33,14 @@ from pre_procesamiento.prepro_localizacion import (
     fetch_top2_event_coords_for_ids,
     apply_two_attempt_fix,
     build_jobs_for_vrp,
+    load_cuadrante_from_geojson,
+    filtrar_dentro_cuadrante,
     SHAPELY_AVAILABLE
 )
 
 # Configuración
 FLASK_SERVER = "http://localhost:5000"
+RUTA7_GEOJSON = "geojson/rutas/cali/ruta 7.geojson"
 logging.basicConfig(level=logging.ERROR, format="%(asctime)s - %(levelname)s - %(message)s", filename="errors.log")
 
 def manejar_error(funcion, *args, **kwargs):
@@ -89,23 +95,6 @@ def generar_mapa_clientes(ciudad: str, id_ruta: int, df: pd.DataFrame) -> Tuple[
         
         # Crear mapa base con prefer_canvas para mejor rendimiento
         m = folium.Map(location=center, zoom_start=zoom_start, prefer_canvas=True)
-
-        # Capa comunas (sin popups)
-        try:
-            fc = cargar_geojson_comunas(ciudad)
-            folium.GeoJson(
-                fc,
-                name="Comunas",
-                style_function=lambda f: {
-                    'fillColor':'#3388ff',
-                    'color':'#0066cc',
-                    'weight':1,
-                    'fillOpacity':0.08
-                }
-            ).add_to(m)
-            print(f"✅ Cargado GeoJSON de comunas para {ciudad}")
-        except Exception as e:
-            print(f"⚠️ Error cargando GeoJSON para {ciudad}: {e}")
 
         # Puntos negros simples (solo verificados)
         if con_coord > 0:
@@ -212,7 +201,7 @@ with col2:
 # Botón para ejecutar el pipeline
 procesar_button = st.button(
     "🚛 Procesar Ruta Piloto",
-    use_container_width=True,
+    width="stretch",
     type="primary",
     help="Ejecutar pipeline completo: etiquetado + reparación + mapa + export"
 )
@@ -302,27 +291,62 @@ if procesar_button:
                 df_final['coord_source'] = 'original'
                 df_final['in_poly_final'] = df_final['in_poly_orig']
             
-            # 5. MÉTRICAS FINALES
-            metrics = compute_metrics_localizacion(df_final)
-            
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Total Clientes", metrics['total_clientes'])
-            with col2:
-                st.metric("Con Coordenadas Iniciales", metrics['con_coordenadas_iniciales'])
-            with col3:
-                st.metric("% Dentro Cuadrante", f"{metrics['pct_dentro_cuadrante']}%")
-            
-            st.success(f"✅ Pipeline completado: {metrics['dentro_cuadrante']} clientes dentro del perímetro")
+            # 5. FILTRAR CUADRANTE RUTA 7
+            with st.spinner("5️⃣ Aplicando filtro de cuadrante Ruta 7..."):
+                try:
+                    # Cargar cuadrante Ruta 7
+                    cuadrante = load_cuadrante_from_geojson(RUTA7_GEOJSON)
+                    
+                    # Usar las coords reparadas para el filtro final del cuadrante
+                    df_inside, df_outside, kpis = filtrar_dentro_cuadrante(
+                        df_final.rename(columns={'lon_final': 'longitud', 'lat_final': 'latitud'}),
+                        cuadrante,
+                        lat_col='latitud',
+                        lon_col='longitud'
+                    )
+                    # Métricas derivadas para UI
+                    kpis['pct_con_coord'] = (100.0 * kpis['con_coord'] / kpis['total']) if kpis['total'] else 0.0
+                    kpis['pct_dentro']   = (100.0 * kpis['dentro']   / kpis['con_coord']) if kpis['con_coord'] else 0.0
+
+                    # DataFrame que alimenta el mapa y la descarga
+                    df_final_filtrado = df_inside.copy()
+                    
+                    # Mostrar KPIs del cuadrante
+                    col1, col2, col3, col4, col5 = st.columns(5)
+                    with col1:
+                        st.metric("Total", kpis['total'])
+                    with col2:
+                        st.metric("Con coord", kpis['con_coord'])
+                    with col3:
+                        st.metric("Sin coord", kpis['sin_coord'])
+                    with col4:
+                        st.metric("Dentro", kpis['dentro'])
+                    with col5:
+                        st.metric("Fuera", kpis['fuera'])
+                    
+                    # Mostrar porcentajes
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("% Con coord", f"{kpis['pct_con_coord']:.1f}%")
+                    with col2:
+                        st.metric("% Dentro", f"{kpis['pct_dentro']:.1f}%")
+                    
+                    st.success(f"✅ Filtro aplicado: {kpis['dentro']} clientes dentro del cuadrante Ruta 7")
+                    
+                except Exception as e:
+                    st.error(f"❌ Error aplicando filtro de cuadrante: {e}")
+                    st.warning("⚠️ Continuando con datos sin filtrar")
+                    df_final_filtrado = df_final.copy()
+                    kpis = None
         
         # 6. GENERAR MAPA
-        with st.spinner("5️⃣ Generando mapa con puntos negros..."):
-            filename, total, con_coord, pct = generar_mapa_clientes(ciudad_seleccionada, id_ruta_seleccionada, df_final)
+        with st.spinner("6️⃣ Generando mapa con puntos negros..."):
+            filename, total, con_coord, pct = generar_mapa_clientes(ciudad_seleccionada, id_ruta_seleccionada, df_final_filtrado)
             
             if filename:
                 map_url = f"{FLASK_SERVER}/maps/{filename}?t={int(time.time())}"
                 st.session_state["map_url"] = map_url
-                st.session_state["vrp_dataset_final"] = df_final
+                st.session_state["vrp_dataset_final"] = df_final_filtrado
                 
                 st.markdown(
                     f"""
@@ -344,12 +368,39 @@ if procesar_button:
                     """, 
                     unsafe_allow_html=True
                 )
+                
+                # 6.1. DESCARGA CSV CUADRANTE
+                if 'df_final_filtrado' in locals() and not df_final_filtrado.empty:
+                    st.markdown("### 📥 Exportar Datos del Cuadrante")
+                    
+                    # Crear CSV para descarga
+                    csv_buffer = io.StringIO()
+                    df_final_filtrado.to_csv(csv_buffer, index=False)
+                    csv_data = csv_buffer.getvalue()
+                    
+                    # Nombre del archivo con timestamp
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    filename_csv = f"ruta7_cuadrante_{timestamp}.csv"
+                    
+                    # Botón de descarga
+                    st.download_button(
+                        label="📥 Descargar CSV Cuadrante Ruta 7",
+                        data=csv_data,
+                        file_name=filename_csv,
+                        mime="text/csv",
+                        width="stretch",
+                        help=f"Descargar {len(df_final_filtrado)} registros del cuadrante Ruta 7"
+                    )
+                    
+                    # Información del archivo
+                    st.info(f"📊 CSV generado: {len(df_final_filtrado)} registros, {len(df_final_filtrado.columns)} columnas")
+                    
             else:
                 st.error("❌ Error generando mapa")
         
         # 7. GENERAR JOBS PARA VRP
-        with st.spinner("6️⃣ Generando jobs VRP..."):
-            jobs_df = build_jobs_for_vrp(df_final)
+        with st.spinner("7️⃣ Generando jobs VRP..."):
+            jobs_df = build_jobs_for_vrp(df_final_filtrado)
             
             if not jobs_df.empty:
                 # Guardar archivo CSV
@@ -406,7 +457,7 @@ if "vrp_jobs_df" in st.session_state and st.session_state["vrp_jobs_df"] is not 
     
     # Mostrar muestra de jobs
     with st.expander("📋 Ver muestra de jobs"):
-        st.dataframe(jobs_df.head(10), use_container_width=True)
+        st.dataframe(jobs_df.head(10), width="stretch")
     
     # Preparar CSV para descarga
     csv_data = jobs_df.to_csv(index=False).encode('utf-8')
@@ -418,7 +469,7 @@ if "vrp_jobs_df" in st.session_state and st.session_state["vrp_jobs_df"] is not 
             data=csv_data,
             file_name=f"jobs_ruta{id_ruta_piloto}.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
             help=f"Descarga {len(jobs_df)} jobs listos para el solver VRP"
         )
 
@@ -455,7 +506,7 @@ if df_export is not None and not df_export.empty and export_meta is not None:
             file_name=filename_csv,
             mime="text/csv",
             type="secondary",
-            use_container_width=True,
+            width="stretch",
             help=f"Descarga datos de {export_meta.get('total_clientes', len(df_export))} clientes, {export_meta.get('clientes_verificados', 0)} con coordenadas"
         )
 else:
@@ -464,7 +515,7 @@ else:
         st.button(
             "📥 Descargar CSV (datos mostrados)",
             disabled=True,
-            use_container_width=True,
+            width="stretch",
             help="Genere primero un mapa para habilitar la descarga"
         )
 

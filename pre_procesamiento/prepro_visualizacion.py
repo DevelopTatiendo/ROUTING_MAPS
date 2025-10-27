@@ -245,6 +245,7 @@ def contactos_base_por_ruta(id_ruta: int) -> pd.DataFrame:
         WHERE r.id = %s
           AND c.estado_cxc IN (0,1)
           AND c.estado = 1
+          AND c.id_medio_contacto = 5
         """
         
         df = pd.read_sql(query, conn, params=[int(id_ruta)])
