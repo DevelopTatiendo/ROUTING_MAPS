@@ -140,7 +140,7 @@ def dataset_visualizacion_por_ruta(id_ruta: int) -> pd.DataFrame:
         # Reordenar columnas para salida consistente
         columns_order = [
             'id_contacto', 'id_ruta', 'nombre_ruta', 'id_barrio', 'nombre_barrio', 
-            'direccion', 'ultima_compra', 'lat', 'lon', 'fecha_evento', 'id_evento', 'verificado'
+            'direccion', 'ultima_compra', 'fecha_prox_visita_venta', 'lat', 'lon', 'fecha_evento', 'id_evento', 'verificado'
         ]
         
         # Solo incluir columnas que existen

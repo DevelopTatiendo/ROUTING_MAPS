@@ -412,6 +412,31 @@ if procesar_button:
                 st.session_state["vrp_jobs_file"] = jobs_file
                 
                 st.success(f"✅ {len(jobs_df)} jobs generados y guardados en {jobs_file}")
+                
+                # Enlace a ruteo piloto
+                st.markdown("### 🚛 Siguiente Paso: Ruteo Piloto")
+                st.info("📋 Los jobs están listos. Continúe con la construcción de agenda semanal:")
+                
+                st.markdown(
+                    """
+                    <div style="text-align: center; padding: 1rem;">
+                        <a href="/10_ruteo_piloto" 
+                           style="
+                               display: inline-block; 
+                               padding: 12px 24px; 
+                               background: #28a745; 
+                               color: white; 
+                               text-decoration: none; 
+                               border-radius: 8px; 
+                               font-weight: 600;
+                               box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                           ">
+                            🚛 Ir a Ruteo Piloto
+                        </a>
+                    </div>
+                    """, 
+                    unsafe_allow_html=True
+                )
             else:
                 st.warning("⚠️ No se generaron jobs (sin clientes dentro del perímetro)")
                 
@@ -549,5 +574,6 @@ with st.expander("🔧 Información Técnica"):
     - **Flask Server:** {FLASK_SERVER}
     - **Ciudad piloto:** CALI
     - **BD Connection:** {'✅ Configurada' if os.getenv('DB_HOST') else '❌ Sin configurar'}
-    - **Próximos pasos:** Integración con datos reales de clientes y algoritmos VRP
+    - **🚛 Ruteo Piloto:** [Ir a construcción de agenda semanal](/10_ruteo_piloto)
+    - **Próximos pasos:** Integración VROOM/OSRM para optimización de rutas
     """)

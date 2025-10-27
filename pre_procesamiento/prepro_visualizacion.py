@@ -234,7 +234,8 @@ def contactos_base_por_ruta(id_ruta: int) -> pd.DataFrame:
             c.id_barrio,
             b.barrio              AS nombre_barrio,
             c.direccion_entrega   AS direccion,
-            c.ultima_compra       AS ultima_compra
+            c.ultima_compra       AS ultima_compra,
+            c.fecha_prox_visita_venta
         FROM fullclean_contactos.vwContactos c
         JOIN fullclean_contactos.barrios b
           ON b.Id = c.id_barrio
@@ -257,7 +258,7 @@ def contactos_base_por_ruta(id_ruta: int) -> pd.DataFrame:
     except Exception as e:
         print(f"[ERROR] Error consultando contactos base para ruta {id_ruta}: {e}")
         # Retornar DataFrame vacío en caso de error
-        return pd.DataFrame(columns=['id_contacto', 'id_ruta', 'nombre_ruta', 'id_barrio', 'nombre_barrio', 'direccion', 'ultima_compra'])
+        return pd.DataFrame(columns=['id_contacto', 'id_ruta', 'nombre_ruta', 'id_barrio', 'nombre_barrio', 'direccion', 'ultima_compra', 'fecha_prox_visita_venta'])
 
 
 def cargar_geojson_comunas(ciudad: str) -> dict:
