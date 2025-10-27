@@ -531,3 +531,210 @@ def filtrar_dentro_cuadrante(
     print(f"✅ Filtrado cuadrante: {kpis['dentro']}/{kpis['total']} puntos dentro")
     
     return df_inside, df_outside, kpis
+
+
+# === FILTROS DE NEGOCIO ===
+
+def fetch_visita_reciente_flags(
+    contact_ids: list[int],
+    dias_ventana: int = 30,
+    tipos_validos: tuple[int, ...] = (73, 74, 76, 71, 57, 62, 64)
+) -> pd.DataFrame:
+    """
+    Devuelve DataFrame con columnas:
+      ['id_contacto', 'visita_reciente']  (bool/int {0,1})
+    Marca 1 si el contacto tiene algún evento en tipos_validos
+    con fecha_evento >= CURDATE() - INTERVAL dias_ventana DAY.
+    Debe procesar en batches (p.ej. 5000 IDs) y usar IN (...).
+    En error de BD: retornar DF vacío (sin bloquear).
+    """
+    if not contact_ids:
+        return pd.DataFrame(columns=['id_contacto', 'visita_reciente'])
+    
+    try:
+        conn = _get_db_connection()
+        batch_size = 5000
+        all_results = []
+        
+        # Procesar en batches
+        for i in range(0, len(contact_ids), batch_size):
+            batch_ids = contact_ids[i:i + batch_size]
+            
+            # Crear placeholders para IN
+            placeholders_ids = ','.join(['%s'] * len(batch_ids))
+            placeholders_types = ','.join(['%s'] * len(tipos_validos))
+            
+            query = f"""
+            SELECT e.id_contacto,
+                   MAX(e.fecha_evento) AS fecha_reciente
+            FROM fullclean_contactos.vwEventos e
+            WHERE e.id_contacto IN ({placeholders_ids})
+              AND e.id_evento_tipo IN ({placeholders_types})
+            GROUP BY e.id_contacto
+            HAVING MAX(e.fecha_evento) >= DATE_SUB(CURDATE(), INTERVAL %s DAY)
+            """
+            
+            params = [int(x) for x in batch_ids] + list(tipos_validos) + [dias_ventana]
+            df_batch = pd.read_sql(query, conn, params=params)
+            all_results.append(df_batch)
+        
+        conn.close()
+        
+        # Combinar resultados
+        if all_results:
+            df_recent = pd.concat(all_results, ignore_index=True)
+        else:
+            df_recent = pd.DataFrame(columns=['id_contacto', 'fecha_reciente'])
+        
+        # Crear DataFrame completo con flags
+        df_all_contacts = pd.DataFrame({'id_contacto': contact_ids})
+        df_result = df_all_contacts.merge(
+            df_recent[['id_contacto']], 
+            on='id_contacto', 
+            how='left',
+            indicator=True
+        )
+        df_result['visita_reciente'] = (df_result['_merge'] == 'both').astype(int)
+        df_result = df_result[['id_contacto', 'visita_reciente']]
+        
+        print(f"[INFO] Visitas recientes: {df_result['visita_reciente'].sum()}/{len(contact_ids)} contactos")
+        return df_result
+        
+    except Exception as e:
+        print(f"[ERROR] Error obteniendo visitas recientes: {e}")    
+        # Devolver DF vacío en caso de error (degradación elegante)
+        return pd.DataFrame(columns=['id_contacto', 'visita_reciente'])
+
+
+def apply_business_filters(
+    df_candidates: pd.DataFrame,
+    aplicar_compra_reciente: bool = True,
+    aplicar_visita_reciente: bool = True,
+    meses_ultima_compra: int = 6,
+    dias_visita_reciente: int = 30,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Entradas:
+      df_candidates: DF posterior a localización/perímetro/arreglo coords,
+                     DEBE contener al menos:
+                     ['id_contacto','lon_final','lat_final','in_poly_final','ultima_compra'].
+    Salida:
+      (df_filtrado, kpis_dict)
+      kpis_dict = {
+         'antes_total': int,
+         'despues_total': int,
+         'excluidos_compra_reciente': int,
+         'excluidos_visita_reciente': int
+      }
+    Reglas:
+      - Trabajar solo con filas elegibles: in_poly_final==True y lon_final/lat_final notna.
+      - Compra reciente: excluir si ultima_compra >= (hoy - meses_ultima_compra).
+        Tratar ultima_compra nula como NO reciente (no excluir).
+      - Visita reciente: llamar fetch_visita_reciente_flags(ids_elegibles).
+        Excluir ids con visita_reciente==1.
+      - En caso de error en fetch_visita_reciente_flags → log y continuar sin ese filtro.
+      - NO modificar columnas de coordenadas; mantener el DF en el mismo orden/columnas.
+    """
+    from datetime import date, timedelta
+    
+    # Identificar filas elegibles
+    mask_elegibles = (
+        (df_candidates['in_poly_final'] == True) & 
+        df_candidates['lon_final'].notna() & 
+        df_candidates['lat_final'].notna()
+    )
+    
+    df_elegibles = df_candidates[mask_elegibles].copy()
+    antes_total = len(df_elegibles)
+    
+    # Inicializar contadores
+    excluidos_compra = 0
+    excluidos_visita = 0
+    
+    # Crear máscara de inclusión (inicialmente todos incluidos)
+    mask_incluir = pd.Series(True, index=df_elegibles.index)
+    
+    # Filtro 1: Compra reciente
+    if aplicar_compra_reciente and 'ultima_compra' in df_elegibles.columns:
+        # Calcular fecha límite
+        fecha_limite = date.today() - timedelta(days=meses_ultima_compra * 30)
+        
+        # Convertir ultima_compra a fecha y manejar nulos
+        df_elegibles['ultima_compra_date'] = pd.to_datetime(df_elegibles['ultima_compra'], errors='coerce').dt.date
+        
+        # Excluir si tienen compra reciente (>= fecha_limite)
+        mask_compra_reciente = (
+            df_elegibles['ultima_compra_date'].notna() & 
+            (df_elegibles['ultima_compra_date'] >= fecha_limite)
+        )
+        
+        excluidos_compra = mask_compra_reciente.sum()
+        mask_incluir = mask_incluir & ~mask_compra_reciente
+        
+        print(f"[INFO] Filtro compra reciente: {excluidos_compra} excluidos (>= {fecha_limite})")
+    
+    # Filtro 2: Visita reciente
+    if aplicar_visita_reciente:
+        try:
+            # Obtener IDs de contactos elegibles después del filtro de compra
+            ids_for_visita = df_elegibles[mask_incluir]['id_contacto'].astype(int).tolist()
+            
+            if ids_for_visita:
+                df_visitas = fetch_visita_reciente_flags(ids_for_visita, dias_visita_reciente)
+                
+                if not df_visitas.empty:
+                    # Merge con datos elegibles
+                    df_elegibles = df_elegibles.merge(
+                        df_visitas, 
+                        on='id_contacto', 
+                        how='left'
+                    )
+                    df_elegibles['visita_reciente'] = df_elegibles['visita_reciente'].fillna(0)
+                    
+                    # Aplicar filtro de visita reciente
+                    mask_visita_reciente = df_elegibles['visita_reciente'] == 1
+                    excluidos_visita = (mask_incluir & mask_visita_reciente).sum()
+                    mask_incluir = mask_incluir & ~mask_visita_reciente
+                    
+                    print(f"[INFO] Filtro visita reciente: {excluidos_visita} excluidos (últimos {dias_visita_reciente} días)")
+                else:
+                    print("[WARNING] No se obtuvieron datos de visitas recientes, continuando sin este filtro")
+            else:
+                print("[INFO] No hay contactos elegibles para verificar visitas recientes")
+                
+        except Exception as e:
+            print(f"[WARNING] Error en filtro de visita reciente: {e}, continuando sin este filtro")
+    
+    # Aplicar filtros al DataFrame completo (no solo elegibles)
+    df_result = df_candidates.copy()
+    
+    # Marcar como excluidos los que no pasan los filtros de negocio
+    ids_incluir = df_elegibles[mask_incluir]['id_contacto'].tolist()
+    ids_elegibles_originales = df_elegibles['id_contacto'].tolist()
+    
+    # Los que estaban elegibles pero ya no están incluidos, se marcan como fuera del perímetro
+    mask_excluir_negocio = (
+        df_result['id_contacto'].isin(ids_elegibles_originales) & 
+        ~df_result['id_contacto'].isin(ids_incluir)
+    )
+    
+    # Mantener solo los que pasan todos los filtros O no eran elegibles inicialmente
+    df_result.loc[mask_excluir_negocio, 'in_poly_final'] = False
+    
+    despues_total = len(df_result[
+        (df_result['in_poly_final'] == True) & 
+        df_result['lon_final'].notna() & 
+        df_result['lat_final'].notna()
+    ])
+    
+    # KPIs
+    kpis = {
+        'antes_total': antes_total,
+        'despues_total': despues_total,
+        'excluidos_compra_reciente': excluidos_compra,
+        'excluidos_visita_reciente': excluidos_visita
+    }
+    
+    print(f"[INFO] Filtros aplicados: {antes_total} → {despues_total} contactos elegibles")
+    
+    return df_result, kpis

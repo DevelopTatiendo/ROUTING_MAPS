@@ -244,7 +244,7 @@ def contactos_base_por_ruta(id_ruta: int) -> pd.DataFrame:
         JOIN fullclean_contactos.rutas_cobro r
           ON r.id = rcz.id_ruta_cobro
         WHERE r.id = %s
-          AND c.estado_cxc IN (0,1)
+          AND c.estado_cxc = 1 
           AND c.estado = 1
           AND c.id_medio_contacto = 5
         """

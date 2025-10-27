@@ -35,6 +35,7 @@ from pre_procesamiento.prepro_localizacion import (
     build_jobs_for_vrp,
     load_cuadrante_from_geojson,
     filtrar_dentro_cuadrante,
+    apply_business_filters,
     SHAPELY_AVAILABLE
 )
 
@@ -179,7 +180,7 @@ st.sidebar.success(f"**Perímetro:** cali_perimetro_piloto.geojson")
 id_ruta_seleccionada = id_ruta_piloto  
 nombre_ruta_seleccionada = nombre_ruta_piloto
 
-st.sidebar.markdown("---")
+
 
 # === MAIN: PIPELINE VRP PILOTO ===
 st.header("� VRP Piloto - Etiquetado y Reparación")
@@ -196,6 +197,40 @@ with col2:
             st.metric("Perímetro", "❌ Faltante")
     except Exception:
         st.metric("Perímetro", "❌ Error")
+
+# === FILTROS DE NEGOCIO (en cuerpo, 2 bloques) ===
+st.subheader("🧩 Filtros de negocio (previos a jobs)")
+col_f1, col_f2 = st.columns(2)
+
+with col_f1:
+    with st.container(border=True):
+        st.markdown("**Compras recientes**")
+        chk_excluir_compra_reciente = st.checkbox(
+            "Excluir compras recientes",
+            value=True,
+            help="Excluir clientes con ultima_compra ≥ hoy − N meses"
+        )
+        meses_compra = st.number_input(
+            "Meses compra reciente",
+            min_value=1, max_value=24, value=6, step=1,
+            help="Umbral en meses para considerar una compra como reciente",
+            disabled=not chk_excluir_compra_reciente
+        )
+
+with col_f2:
+    with st.container(border=True):
+        st.markdown("**Visitas recientes**")
+        chk_excluir_visita_reciente = st.checkbox(
+            "Excluir visitas recientes",
+            value=True,
+            help="Excluir si tiene eventos {73,74,76,71,57,62,64} dentro de N días"
+        )
+        dias_visita = st.number_input(
+            "Días visita reciente",
+            min_value=7, max_value=90, value=30, step=1,
+            help="Ventana en días para visita válida reciente",
+            disabled=not chk_excluir_visita_reciente
+        )
 
 # Formulario principal
 # Botón para ejecutar el pipeline
@@ -339,8 +374,43 @@ if procesar_button:
                     df_final_filtrado = df_final.copy()
                     kpis = None
         
-        # 6. GENERAR MAPA
-        with st.spinner("6️⃣ Generando mapa con puntos negros..."):
+        # 6. APLICAR FILTROS DE NEGOCIO
+        with st.spinner("6️⃣ Aplicando filtros de negocio..."):
+            if chk_excluir_compra_reciente or chk_excluir_visita_reciente:
+                try:
+                    df_business_filtered, kpis_business = apply_business_filters(
+                        df_final_filtrado,
+                        aplicar_compra_reciente=chk_excluir_compra_reciente,
+                        aplicar_visita_reciente=chk_excluir_visita_reciente,
+                        meses_ultima_compra=meses_compra,
+                        dias_visita_reciente=dias_visita
+                    )
+                    
+                    # Mostrar KPIs de filtros de negocio
+                    st.subheader("📊 KPIs Filtros de Negocio")
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Antes", kpis_business['antes_total'])
+                    with col2:
+                        st.metric("Excl. Compra", kpis_business['excluidos_compra_reciente'])
+                    with col3:
+                        st.metric("Excl. Visita", kpis_business['excluidos_visita_reciente'])  
+                    with col4:
+                        st.metric("Después", kpis_business['despues_total'])
+                    
+                    # Actualizar DataFrame para siguientes pasos
+                    df_final_filtrado = df_business_filtered
+                    
+                    st.success(f"✅ Filtros aplicados: {kpis_business['antes_total']} → {kpis_business['despues_total']} contactos elegibles")
+                    
+                except Exception as e:
+                    st.error(f"❌ Error aplicando filtros de negocio: {e}")
+                    st.warning("⚠️ Continuando sin filtros de negocio")
+            else:
+                st.info("ℹ️ Filtros de negocio deshabilitados")
+        
+        # 7. GENERAR MAPA
+        with st.spinner("7️⃣ Generando mapa con puntos negros..."):
             filename, total, con_coord, pct = generar_mapa_clientes(ciudad_seleccionada, id_ruta_seleccionada, df_final_filtrado)
             
             if filename:
@@ -398,8 +468,8 @@ if procesar_button:
             else:
                 st.error("❌ Error generando mapa")
         
-        # 7. GENERAR JOBS PARA VRP
-        with st.spinner("7️⃣ Generando jobs VRP..."):
+        # 8. GENERAR JOBS PARA VRP
+        with st.spinner("8️⃣ Generando jobs VRP..."):
             jobs_df = build_jobs_for_vrp(df_final_filtrado)
             
             if not jobs_df.empty:
