@@ -12,8 +12,19 @@ import os
 import io
 import json
 import re
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
+
+# Flask server configuration
+FLASK_SERVER = os.getenv("FLASK_SERVER", "http://localhost:5000")
+
+def absolute_map_url(rel_path: str, add_cache: bool = True) -> str:
+    """
+    Devuelve la URL absoluta al Flask server para un path relativo /maps/*.html.
+    """
+    base = f"{FLASK_SERVER}{rel_path}"
+    return f"{base}?t={int(time.time())}" if add_cache else base
 
 # Imports del proyecto
 from vrp.selection.semana import (
@@ -450,9 +461,10 @@ else:
                     st.write("Sin clientes")
             
             with col3:
-                # Enlace al mapa
+                # Enlace al mapa con URL absoluta
+                full_url = absolute_map_url(map_url)
                 st.markdown(f"""
-                <a href="{map_url}" target="_blank" 
+                <a href="{full_url}" target="_blank" rel="noopener noreferrer"
                    style="
                        display: inline-block; 
                        padding: 8px 16px; 
@@ -520,10 +532,11 @@ if 'weekly_agenda' in st.session_state:
     with col1:
         # Mostrar mapa usando la URL de Flask
         map_url = persist_results['day_paths'][selected_day_idx]['map_url']
+        full_url = absolute_map_url(map_url)
         
         st.markdown(f"""
         <div style="text-align: center; margin-bottom: 1rem;">
-            <a href="{map_url}" target="_blank" 
+            <a href="{full_url}" target="_blank" rel="noopener noreferrer"
                style="
                    display: inline-block; 
                    padding: 12px 24px; 
@@ -540,15 +553,18 @@ if 'weekly_agenda' in st.session_state:
         
         # Intentar incrustar el mapa (si Flask está ejecutándose)
         try:
+            test_url = absolute_map_url(map_url, add_cache=False)
+            # Para el embed probamos sin cache-busting
+            test_url = test_url.split("?")[0]
             import requests
-            response = requests.get(f"http://localhost:5000{map_url}", timeout=2)
+            response = requests.get(test_url, timeout=2)
             if response.status_code == 200:
                 st.components.v1.html(response.text, height=500)
             else:
                 st.warning("⚠️ Flask server no disponible. Use el enlace de arriba para ver el mapa.")
         except:
             st.info("ℹ️ Para ver el mapa incrustado, inicie el Flask server con `python flask_server.py`")
-            st.markdown(f"🔗 **Enlace directo al mapa:** {map_url}")
+            st.markdown(f"🔗 **Enlace directo al mapa:** {full_url}")
     
     with col2:
         st.markdown(f"### 📊 Día {day_idx}")
