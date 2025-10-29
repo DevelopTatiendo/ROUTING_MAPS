@@ -1,2 +1,17 @@
 2025-10-06 21:00:26,573 - ERROR - Error en generar_mapa_stub: The field nombre is not available in the data. Choose from: ('FID', 'OBJECTID', 'COMUNA', 'NOMBRE', 'CICLOS_EMC', 'RED_SALUD', 'ZONA_RECOL', 'OPER_RECOL', 'CENT_ZONAL', 'SDE_CAT_GE', 'PERIMETRO', 'VI_FAM_SEX', 'CONSU_AGUA', 'CONSU_ENER', 'SHAPE_AREA', 'SHAPE_LEN', 'Shape__Area', 'Shape__Length').
 2025-10-06 21:32:39,971 - ERROR - Error en generar_mapa_stub: The field nombre is not available in the data. Choose from: ('FID', 'OBJECTID', 'COMUNA', 'NOMBRE', 'CICLOS_EMC', 'RED_SALUD', 'ZONA_RECOL', 'OPER_RECOL', 'CENT_ZONAL', 'SDE_CAT_GE', 'PERIMETRO', 'VI_FAM_SEX', 'CONSU_AGUA', 'CONSU_ENER', 'SHAPE_AREA', 'SHAPE_LEN', 'Shape__Area', 'Shape__Length').
+2025-10-29 12:34:00,050 - ERROR - TSP solving failed: Wrong number or type of arguments for overloaded function 'new_RoutingIndexManager'.
+  Possible C/C++ prototypes are:
+    operations_research::RoutingIndexManager::RoutingIndexManager(int,int,operations_research::RoutingIndexManager::NodeIndex)
+    operations_research::RoutingIndexManager::RoutingIndexManager(int,int,std::vector< operations_research::RoutingIndexManager::NodeIndex > const &,std::vector< operations_research::RoutingIndexManager::NodeIndex > const &)
+
+2025-10-29 12:37:17,259 - ERROR - TSP solving failed: Wrong number or type of arguments for overloaded function 'new_RoutingIndexManager'.
+  Possible C/C++ prototypes are:
+    operations_research::RoutingIndexManager::RoutingIndexManager(int,int,operations_research::RoutingIndexManager::NodeIndex)
+    operations_research::RoutingIndexManager::RoutingIndexManager(int,int,std::vector< operations_research::RoutingIndexManager::NodeIndex > const &,std::vector< operations_research::RoutingIndexManager::NodeIndex > const &)
+
+2025-10-29 12:42:02,248 - ERROR - TSP solving failed: Wrong number or type of arguments for overloaded function 'new_RoutingIndexManager'.
+  Possible C/C++ prototypes are:
+    operations_research::RoutingIndexManager::RoutingIndexManager(int,int,operations_research::RoutingIndexManager::NodeIndex)
+    operations_research::RoutingIndexManager::RoutingIndexManager(int,int,std::vector< operations_research::RoutingIndexManager::NodeIndex > const &,std::vector< operations_research::RoutingIndexManager::NodeIndex > const &)
+

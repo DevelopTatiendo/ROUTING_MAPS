@@ -618,7 +618,7 @@ if 'weekly_agenda' in st.session_state:
         # Resumen JSON
         if 'persist_results' in st.session_state:
             summary = persist_results['summary']
-            summary_json = pd.io.json.dumps(summary, indent=2)
+            summary_json = json.dumps(summary, indent=2, ensure_ascii=False)
             
             st.download_button(
                 label="📄 Descargar Resumen JSON",

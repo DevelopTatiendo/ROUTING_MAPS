@@ -7,6 +7,7 @@ import numpy as np
 from typing import Dict, List, Optional, Tuple, Any, Union
 import time
 import logging
+from pathlib import Path
 
 from .matrix import OSRMClient, MatrixManager
 from .solver import ORToolsVRPSolver, VRPSolution
@@ -409,3 +410,209 @@ def solve_vrp(locations: pd.DataFrame, **kwargs) -> Dict[str, Any]:
     """
     system = VRPSystem()
     return system.solve_vrp_complete(locations, **kwargs)
+
+
+# === ROUTING RUNS DISCOVERY UTILITIES ===
+
+def get_routing_runs_dir() -> 'Path':
+    """Get routing runs directory path"""
+    from pathlib import Path
+    import os
+    
+    base_dir = os.getenv('ROUTING_RUNS_DIR', 'routing_runs')
+    if not os.path.isabs(base_dir):
+        # Relative to repo root
+        repo_root = Path(__file__).parent.parent
+        base_dir = repo_root / base_dir
+    else:
+        base_dir = Path(base_dir)
+    
+    return base_dir
+
+
+def list_weeks(base: 'Path' = None) -> List[str]:
+    """List available weeks in routing_runs directory
+    
+    Args:
+        base: Base directory path, defaults to get_routing_runs_dir()
+        
+    Returns:
+        List of week tags like ['semana_20251027', 'semana_TEST_FIX']
+    """
+    if base is None:
+        base = get_routing_runs_dir()
+    
+    week_dirs = []
+    if base.exists():
+        for item in base.iterdir():
+            if item.is_dir() and item.name.startswith('semana_'):
+                week_dirs.append(item.name)
+    
+    # Sort by modification time, most recent first
+    week_dirs.sort(key=lambda w: (base / w).stat().st_mtime, reverse=True)
+    
+    return week_dirs
+
+
+def get_latest_week(base: 'Path' = None) -> str:
+    """Get latest week tag from routing_runs/latest.json or latest (no extension) or most recent by mtime
+    
+    Args:
+        base: Base directory path, defaults to get_routing_runs_dir()
+        
+    Returns:
+        Week tag like 'semana_20251027' or None if no weeks found
+    """
+    if base is None:
+        base = get_routing_runs_dir()
+
+    # 1) Intentar latest.json y latest (sin extensión)
+    for fname in ('latest.json', 'latest'):
+        latest_file = base / fname
+        if latest_file.exists():
+            try:
+                import json
+                with open(latest_file, 'r', encoding='utf-8') as f:
+                    latest_data = json.load(f)
+                week_tag = latest_data.get('week_tag')
+                if week_tag and not week_tag.startswith('semana_'):
+                    week_tag = f'semana_{week_tag}'
+                if week_tag and (base / week_tag).exists():
+                    return week_tag
+            except Exception as e:
+                logger.warning(f"Error reading {fname}: {e}")
+
+    # 2) Fallback por mtime
+    weeks = list_weeks(base)
+    return weeks[0] if weeks else None
+
+
+def list_days(week_tag: str, base: 'Path' = None) -> List[int]:
+    """List available days for a given week
+    
+    Args:
+        week_tag: Week tag like 'semana_20251027'
+        base: Base directory path, defaults to get_routing_runs_dir()
+        
+    Returns:
+        List of day numbers like [1, 2, 3, 4, 5, 6]
+    """
+    if base is None:
+        base = get_routing_runs_dir()
+    
+    week_dir = base / week_tag
+    if not week_dir.exists():
+        return []
+    
+    days = []
+    
+    # Try both structures:
+    # 1. shortlists/day_N_shortlist.csv (new spec)
+    # 2. seleccion/day_N/shortlist.csv (current structure)
+    
+    shortlists_dir = week_dir / 'shortlists'
+    if shortlists_dir.exists():
+        # New structure: shortlists/day_N_shortlist.csv
+        import re
+        for item in shortlists_dir.iterdir():
+            if item.is_file() and item.name.endswith('_shortlist.csv'):
+                match = re.match(r'day_(\d+)_shortlist\.csv', item.name)
+                if match:
+                    days.append(int(match.group(1)))
+    else:
+        # Current structure: seleccion/day_N/shortlist.csv
+        seleccion_dir = week_dir / 'seleccion'
+        if seleccion_dir.exists():
+            for item in seleccion_dir.iterdir():
+                if item.is_dir() and item.name.startswith('day_'):
+                    try:
+                        day_num = int(item.name.split('_')[1])
+                        shortlist_file = item / 'shortlist.csv'
+                        if shortlist_file.exists():
+                            days.append(day_num)
+                    except (ValueError, IndexError):
+                        continue
+    
+    return sorted(days)
+
+
+def load_day_shortlist(week_tag: str, day_i: int, base: 'Path' = None) -> 'pd.DataFrame':
+    """Load shortlist CSV for a specific day
+    
+    Args:
+        week_tag: Week tag like 'semana_20251027'
+        day_i: Day number like 1, 2, 3, etc.
+        base: Base directory path, defaults to get_routing_runs_dir()
+        
+    Returns:
+        DataFrame with columns: id_contacto, lon, lat (normalized)
+        
+    Raises:
+        FileNotFoundError: If shortlist file doesn't exist
+        ValueError: If required columns are missing or invalid data
+    """
+    import pandas as pd
+    import numpy as np
+    
+    if base is None:
+        base = get_routing_runs_dir()
+    
+    week_dir = base / week_tag
+    if not week_dir.exists():
+        raise FileNotFoundError(f"Week directory not found: {week_dir}")
+    
+    # Try both file structures
+    shortlist_file = None
+    
+    # 1. New structure: shortlists/day_N_shortlist.csv
+    new_path = week_dir / 'shortlists' / f'day_{day_i}_shortlist.csv'
+    if new_path.exists():
+        shortlist_file = new_path
+    else:
+        # 2. Current structure: seleccion/day_N/shortlist.csv
+        old_path = week_dir / 'seleccion' / f'day_{day_i}' / 'shortlist.csv'
+        if old_path.exists():
+            shortlist_file = old_path
+    
+    if shortlist_file is None:
+        raise FileNotFoundError(f"Shortlist file not found for {week_tag} day {day_i}")
+    
+    # Load CSV
+    try:
+        df = pd.read_csv(shortlist_file)
+    except Exception as e:
+        raise ValueError(f"Error reading shortlist file: {e}")
+    
+    # Normalize column names
+    # Accept aliases: id_cliente|job_id -> id_contacto
+    if 'id_cliente' in df.columns and 'id_contacto' not in df.columns:
+        df = df.rename(columns={'id_cliente': 'id_contacto'})
+    elif 'job_id' in df.columns and 'id_contacto' not in df.columns:
+        df = df.rename(columns={'job_id': 'id_contacto'})
+    
+    # Validate required columns
+    required_cols = ['id_contacto', 'lon', 'lat']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Missing required columns: {missing_cols}. Available: {list(df.columns)}")
+    
+    # Validate coordinate ranges
+    if not df['lat'].between(-90, 90).all():
+        raise ValueError("Latitude values outside valid range (-90, 90)")
+    
+    if not df['lon'].between(-180, 180).all():
+        raise ValueError("Longitude values outside valid range (-180, 180)")
+    
+    # Check for null values
+    if df[required_cols].isnull().any().any():
+        raise ValueError("Null values found in required columns")
+    
+    # Check for degenerate data (all points the same)
+    lat_range = df['lat'].max() - df['lat'].min()
+    lon_range = df['lon'].max() - df['lon'].min()
+    if lat_range < 1e-6 and lon_range < 1e-6:
+        raise ValueError("Degenerate data: all points are at the same location")
+    
+    logger.info(f"Loaded {len(df)} locations from {shortlist_file}")
+    
+    return df[required_cols]

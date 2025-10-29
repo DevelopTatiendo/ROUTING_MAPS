@@ -292,3 +292,162 @@ class MatrixManager:
         }
         
         return stats
+
+
+def get_cost_matrix(coords: List[Tuple[float, float]], 
+                   metric: str = "duration") -> Tuple[np.ndarray, str]:
+    """Get cost matrix for TSP with OSRM fallback to Haversine
+    
+    Args:
+        coords: List of (lon, lat) coordinate tuples
+        metric: "duration" for time matrix or "distance" for distance matrix
+        
+    Returns:
+        Tuple of (cost_matrix, source) where source is "osrm" or "haversine"
+        
+    Raises:
+        ValueError: If coords list is too large (N > 200) or invalid metric
+    """
+    import hashlib
+    import json
+    import os
+    from pathlib import Path
+    
+    # Validate inputs
+    if len(coords) > 200:
+        raise ValueError(f"Matrix too large: {len(coords)} > 200 locations")
+    
+    if metric not in ["duration", "distance"]:
+        raise ValueError(f"Invalid metric: {metric}. Must be 'duration' or 'distance'")
+    
+    if len(coords) <= 1:
+        # Trivial case
+        n = len(coords)
+        return np.zeros((n, n)), "trivial"
+    
+    # Create cache key from coordinates
+    coords_key = hashlib.md5(
+        json.dumps(coords, sort_keys=True).encode()
+    ).hexdigest()[:12]
+    
+    # Try to load from cache first
+    cache_dir = Path("routing_runs/cache/matrices")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / f"matrix_{coords_key}_{metric}.npz"
+    
+    if cache_file.exists():
+        try:
+            cached = np.load(cache_file)
+            matrix = cached['matrix'] 
+            source = str(cached['source'])
+            logger.info(f"Loaded {metric} matrix from cache: {cache_file.name}")
+            return matrix, source
+        except Exception as e:
+            logger.warning(f"Error loading cache {cache_file}: {e}")
+    
+    # Convert coords to DataFrame format for MatrixManager
+    locations_df = pd.DataFrame([
+        {'lat': lat, 'lon': lon} for lon, lat in coords
+    ])
+    
+    # Try OSRM first
+    try:
+        osrm_client = OSRMClient()
+        matrix_manager = MatrixManager(osrm_client=osrm_client)
+        
+        if matrix_manager.osrm_available:
+            logger.info(f"Computing {metric} matrix via OSRM...")
+            distance_matrix, time_matrix = matrix_manager.get_matrices(locations_df)
+            
+            # Select requested metric
+            if metric == "duration":
+                cost_matrix = time_matrix
+            else:  # distance
+                cost_matrix = distance_matrix
+            
+            # Save to cache
+            try:
+                np.savez_compressed(
+                    cache_file,
+                    matrix=cost_matrix,
+                    source="osrm"
+                )
+                logger.info(f"Cached OSRM matrix: {cache_file.name}")
+            except Exception as e:
+                logger.warning(f"Error caching matrix: {e}")
+            
+            return cost_matrix, "osrm"
+            
+    except Exception as e:
+        logger.warning(f"OSRM matrix computation failed: {e}")
+    
+    # Fallback to Haversine
+    logger.info(f"Computing {metric} matrix via Haversine fallback...")
+    
+    try:
+        cost_matrix = _compute_haversine_matrix(coords, metric)
+        
+        # Save to cache
+        try:
+            np.savez_compressed(
+                cache_file,
+                matrix=cost_matrix,
+                source="haversine"
+            )
+            logger.info(f"Cached Haversine matrix: {cache_file.name}")
+        except Exception as e:
+            logger.warning(f"Error caching matrix: {e}")
+        
+        return cost_matrix, "haversine"
+        
+    except Exception as e:
+        logger.error(f"Haversine matrix computation failed: {e}")
+        raise
+
+
+def _compute_haversine_matrix(coords: List[Tuple[float, float]], 
+                            metric: str) -> np.ndarray:
+    """Compute cost matrix using Haversine distance
+    
+    Args:
+        coords: List of (lon, lat) coordinate tuples  
+        metric: "duration" or "distance"
+        
+    Returns:
+        Cost matrix (NxN numpy array)
+    """
+    import math
+    
+    n = len(coords)
+    matrix = np.zeros((n, n))
+    
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                matrix[i, j] = 0.0
+            else:
+                # Haversine distance
+                lon1, lat1 = coords[i]
+                lon2, lat2 = coords[j]
+                
+                # Convert to radians
+                lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+                
+                # Haversine formula
+                dlat = lat2 - lat1
+                dlon = lon2 - lon1
+                a = (math.sin(dlat/2)**2 + 
+                     math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2)
+                c = 2 * math.asin(math.sqrt(a))
+                
+                # Earth radius in meters
+                distance_m = c * 6371000
+                
+                if metric == "distance":
+                    matrix[i, j] = distance_m
+                else:  # duration
+                    # Estimate time assuming 30 km/h average speed
+                    time_s = (distance_m / 1000.0) / 30.0 * 3600.0
+                    matrix[i, j] = time_s
+    
+    return matrix
