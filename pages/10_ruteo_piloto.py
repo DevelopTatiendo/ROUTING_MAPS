@@ -16,6 +16,14 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+# Streamlit-folium para mapas interactivos
+try:
+    from streamlit_folium import st_folium
+    FOLIUM_AVAILABLE = True
+except ImportError:
+    FOLIUM_AVAILABLE = False
+    st.warning("⚠️ streamlit-folium no disponible. Instalar con: pip install streamlit-folium")
+
 # Flask server configuration
 FLASK_SERVER = os.getenv("FLASK_SERVER", "http://localhost:5000")
 
@@ -626,6 +634,321 @@ if 'weekly_agenda' in st.session_state:
             week_path = persist_results['week_path']
             st.info(f"📂 Resultados en:\n`{week_path}`")
 
+# === SECCIÓN D: VRP F1 OPTIMIZATION ===
+if 'weekly_agenda' in st.session_state and 'week_tag' in st.session_state:
+    st.markdown("---")
+    st.header("🚀 D. VRP F1 - Optimización de Rutas")
+    
+    # Importaciones VRP F1
+    from pre_procesamiento.prepro_ruteo import build_scenario_from_dfs
+    from vrp import (
+        solve_open_vrp, compute_matrix, batch_route_polylines,
+        build_map_with_antpaths, export_routes_csv, export_routes_geojson,
+        export_map_html, export_summary_report, test_osrm_connection
+    )
+    
+    weekly_agenda = st.session_state['weekly_agenda']
+    week_tag = st.session_state['week_tag']
+    
+    st.success("✅ Agenda semanal disponible - Optimización VRP F1 habilitada")
+    
+    # === CONFIGURACIÓN VRP F1 ===
+    st.subheader("⚙️ Configuración VRP F1")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        selected_vrp_day = st.selectbox(
+            "Día para optimizar:",
+            range(len(weekly_agenda['days'])),
+            format_func=lambda x: f"Día {weekly_agenda['days'][x]['day_index']} ({weekly_agenda['days'][x]['count']} stops)",
+            key="vrp_day_selector"
+        )
+    
+    with col2:
+        max_stops_per_vehicle = st.number_input(
+            "Max stops por vehículo:",
+            min_value=1,
+            max_value=50,
+            value=35,
+            help="Restricción de capacidad por vehículo"
+        )
+    
+    with col3:
+        num_vehicles = st.number_input(
+            "Número de vehículos:",
+            min_value=1,
+            max_value=10,
+            value=2,
+            help="Vehículos disponibles para el día"
+        )
+    
+    with col4:
+        balance_load = st.checkbox(
+            "Balance de carga",
+            value=True,
+            help="Equilibrar stops entre vehículos"
+        )
+    
+    # === CONFIGURACIÓN AVANZADA ===
+    with st.expander("🔧 Configuración Avanzada"):
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            cost_time_weight = st.slider(
+                "Peso tiempo (0.0-1.0):",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.7,
+                step=0.1,
+                help="Peso del tiempo en la función objetivo"
+            )
+            cost_distance_weight = 1.0 - cost_time_weight
+            st.write(f"Peso distancia: {cost_distance_weight:.1f}")
+        
+        with col2:
+            osrm_url = st.text_input(
+                "OSRM Server URL:",
+                value="http://localhost:5001",
+                help="URL del servidor OSRM"
+            )
+            
+            # Test de conexión OSRM
+            if st.button("🔍 Test OSRM", key="test_osrm"):
+                with st.spinner("Probando conexión OSRM..."):
+                    try:
+                        osrm_status = test_osrm_connection(osrm_url)
+                        if osrm_status['connected']:
+                            st.success(f"✅ OSRM OK: {osrm_status['message']}")
+                        else:
+                            st.warning(f"⚠️ OSRM: {osrm_status['message']}")
+                    except Exception as e:
+                        st.error(f"❌ Error OSRM: {e}")
+        
+        with col3:
+            free_start = st.checkbox(
+                "Inicio libre",
+                value=True,
+                help="Vehículos pueden empezar en cualquier stop"
+            )
+            
+            return_to_start = st.checkbox(
+                "Retornar al inicio",
+                value=False,
+                help="Vehículos deben regresar al depot"
+            )
+    
+    # === BOTÓN DE OPTIMIZACIÓN ===
+    vrp_optimize_button = st.button(
+        "🚀 Optimizar VRP F1",
+        type="primary",
+        help="Resolver VRP con OR-Tools y OSRM"
+    )
+    
+    if vrp_optimize_button:
+        selected_day_data = weekly_agenda['days'][selected_vrp_day]
+        day_idx = selected_day_data['day_index']
+        
+        if selected_day_data['count'] == 0:
+            st.error("❌ El día seleccionado no tiene stops para optimizar")
+        else:
+            with st.spinner(f"Optimizando VRP F1 para Día {day_idx}..."):
+                try:
+                    # === PASO 1: BUILD SCENARIO ===
+                    st.info("📋 Paso 1/5: Construyendo scenario...")
+                    
+                    # Obtener datos del día
+                    day_df = selected_day_data['df']
+                    vehicles_df = st.session_state['vehicles_df']
+                    
+                    # Expandir vehículos según num_vehicles
+                    vehicles_expanded = []
+                    for i in range(num_vehicles):
+                        vehicle_base = vehicles_df.iloc[0].copy()
+                        vehicle_base['id_vehiculo'] = f"V{i+1}"
+                        vehicles_expanded.append(vehicle_base)
+                    
+                    vehicles_expanded_df = pd.DataFrame(vehicles_expanded)
+                    
+                    # Build scenario usando la nueva función
+                    scenario = build_scenario_from_dfs(
+                        stops_df=day_df,
+                        vehicles_df=vehicles_expanded_df,
+                        city="CALI",
+                        date=week_tag,
+                        day=day_idx,
+                        max_stops_per_vehicle=max_stops_per_vehicle,
+                        balance_load=balance_load,
+                        start_id=None  # Inicio libre para F1
+                    )
+                    
+                    st.success(f"✅ Scenario: {len(scenario['stops'])} stops, {len(scenario['vehicles'])} vehicles")
+                    
+                    # === PASO 2: COMPUTE MATRIX ===
+                    st.info("🗜️ Paso 2/5: Calculando matriz OSRM...")
+                    
+                    matrix_result = compute_matrix(scenario['stops'], osrm_url)
+                    
+                    if matrix_result['success']:
+                        st.success(f"✅ Matriz: {matrix_result['size']}x{matrix_result['size']}, {matrix_result['method']}")
+                        seconds_matrix = matrix_result['seconds_matrix']
+                        meters_matrix = matrix_result['meters_matrix']
+                    else:
+                        st.error(f"❌ Error matriz: {matrix_result['error']}")
+                        st.stop()
+                    
+                    # === PASO 3: SOLVE VRP ===
+                    st.info("🧮 Paso 3/5: Resolviendo OR-Tools...")
+                    
+                    vrp_solution = solve_open_vrp(scenario, seconds_matrix, meters_matrix)
+                    
+                    routes = vrp_solution['routes']
+                    unserved = vrp_solution['unserved']
+                    kpis = vrp_solution['kpis']
+                    
+                    st.success(f"✅ Solución: {len(routes)} rutas, {kpis['served_pct']:.1f}% servicio")
+                    
+                    # === PASO 4: ROUTE GEOMETRIES ===
+                    st.info("🛣️ Paso 4/5: Calculando geometrías...")
+                    
+                    routes_with_geometry = batch_route_polylines(routes, scenario['stops'], osrm_url)
+                    
+                    geometry_count = sum(1 for r in routes_with_geometry if r.get('geometry', {}).get('geometry_valid', False))
+                    st.success(f"✅ Geometrías: {geometry_count}/{len(routes)} rutas con calles reales")
+                    
+                    # === PASO 5: BUILD MAP ===
+                    st.info("🗺️ Paso 5/5: Construyendo mapa...")
+                    
+                    folium_map = build_map_with_antpaths(
+                        routes_with_geometry, 
+                        scenario,
+                        include_unserved=True
+                    )
+                    
+                    st.success("✅ VRP F1 completado!")
+                    
+                    # === GUARDAR RESULTADOS ===
+                    st.session_state['vrp_solution'] = {
+                        'day_idx': day_idx,
+                        'scenario': scenario,
+                        'routes': routes_with_geometry,
+                        'unserved': unserved,
+                        'kpis': kpis,
+                        'folium_map': folium_map,
+                        'config': {
+                            'max_stops_per_vehicle': max_stops_per_vehicle,
+                            'num_vehicles': num_vehicles,
+                            'balance_load': balance_load,
+                            'cost_weights': {'time': cost_time_weight, 'distance': cost_distance_weight}
+                        }
+                    }
+                    
+                except Exception as e:
+                    st.error(f"❌ Error en optimización VRP: {e}")
+                    st.exception(e)
+    
+    # === MOSTRAR RESULTADOS VRP ===
+    if 'vrp_solution' in st.session_state:
+        st.markdown("---")
+        st.subheader("📊 Resultados VRP F1")
+        
+        vrp_solution = st.session_state['vrp_solution']
+        routes = vrp_solution['routes']
+        kpis = vrp_solution['kpis']
+        day_idx = vrp_solution['day_idx']
+        
+        # === KPIs PRINCIPALES ===
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("% Servicio", f"{kpis['served_pct']:.1f}%")
+        with col2:
+            st.metric("Total KM", f"{kpis['km_total']:.1f}")
+        with col3:
+            st.metric("Total Min", f"{kpis['min_total']:.0f}")
+        with col4:
+            st.metric("Balance σ", f"{kpis['balance_std_stops']:.1f}")
+        
+        # === TABLA DE RUTAS ===
+        st.markdown("#### 🚚 Rutas Generadas")
+        
+        route_summary = []
+        for route in routes:
+            route_summary.append({
+                'Vehículo': route['vehicle_id'],
+                'Stops': route['served'],
+                'KM': f"{route['km']:.1f}",
+                'Minutos': f"{route['min']:.0f}",
+                'Secuencia': ' → '.join(route['sequence'][:3] + (['...'] if len(route['sequence']) > 3 else []))
+            })
+        
+        if route_summary:
+            route_df = pd.DataFrame(route_summary)
+            st.dataframe(route_df, use_container_width=True)
+        
+        # === MAPA INTERACTIVO ===
+        st.markdown("#### 🗺️ Mapa con AntPaths")
+        
+        # Mostrar mapa
+        folium_map = vrp_solution['folium_map']
+        st_folium_data = st_folium(folium_map, width=1000, height=500)
+        
+        # === EXPORTACIÓN ===
+        st.markdown("#### 📁 Exportar Resultados")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            if st.button("📄 CSV", help="Exportar secuencias detalladas"):
+                try:
+                    csv_path = export_routes_csv(routes, vrp_solution['scenario'])
+                    st.success(f"✅ CSV exportado: {csv_path}")
+                except Exception as e:
+                    st.error(f"❌ Error CSV: {e}")
+        
+        with col2:
+            if st.button("🗺️ GeoJSON", help="Exportar puntos y líneas"):
+                try:
+                    geojson_path = export_routes_geojson(routes, vrp_solution['scenario'])
+                    st.success(f"✅ GeoJSON exportado: {geojson_path}")
+                except Exception as e:
+                    st.error(f"❌ Error GeoJSON: {e}")
+        
+        with col3:
+            if st.button("🌐 HTML", help="Exportar mapa interactivo"):
+                try:
+                    html_path = export_map_html(folium_map)
+                    st.success(f"✅ HTML exportado: {html_path}")
+                except Exception as e:
+                    st.error(f"❌ Error HTML: {e}")
+        
+        with col4:
+            if st.button("📋 Reporte", help="Exportar resumen completo"):
+                try:
+                    report_path = export_summary_report(routes, vrp_solution['scenario'])
+                    st.success(f"✅ Reporte exportado: {report_path}")
+                except Exception as e:
+                    st.error(f"❌ Error reporte: {e}")
+        
+        # === INFORMACIÓN TÉCNICA ===
+        with st.expander("🔧 Información Técnica"):
+            config = vrp_solution['config']
+            
+            st.json({
+                "scenario": {
+                    "day": day_idx,
+                    "stops": len(vrp_solution['scenario']['stops']),
+                    "vehicles": len(vrp_solution['scenario']['vehicles'])
+                },
+                "config": config,
+                "solution": {
+                    "routes": len(routes),
+                    "served": sum(r['served'] for r in routes),
+                    "unserved": len(vrp_solution['unserved']),
+                    "kpis": kpis
+                }
+            })
+
 # === FOOTER ===
 st.markdown("---")
 st.markdown("### ℹ️ Información del Sistema")
@@ -639,13 +962,15 @@ with col1:
     - Selección greedy por proximidad
     - Persistencia versionada
     - Mapas interactivos por día
+    - **VRP F1 con OR-Tools + OSRM**
     """)
 
-with col2:
+with col2:    
     st.info("""
-    **🚧 Próximas fases:**
-    - Integración con VROOM/OSRM
-    - Optimización de rutas reales
-    - Validación de ventanas de tiempo
-    - Cálculo de tiempos de servicio
+    **✅ Sistema VRP F1 Completo:**
+    - OR-Tools solver rutas abiertas
+    - OSRM integration (matrix + routing)
+    - AntPaths animados en mapas
+    - Exportación multi-formato
+    - KPIs dinámicos tiempo real
     """)
