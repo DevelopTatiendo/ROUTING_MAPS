@@ -26,6 +26,123 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _create_routing_manager(n_nodes: int, num_vehicles: int, start_idx: int, end_idx: int = None) -> 'pywrapcp.RoutingIndexManager':
+    """
+    Creates RoutingIndexManager with correct signature based on start/end configuration.
+    
+    Args:
+        n_nodes: Total number of nodes
+        num_vehicles: Number of vehicles (typically 1 for TSP)
+        start_idx: Starting node index
+        end_idx: Ending node index (None for circular route)
+    
+    Returns:
+        RoutingIndexManager instance
+    """
+    # Validate inputs
+    assert isinstance(start_idx, int) and 0 <= start_idx < n_nodes, f"Invalid start_idx: {start_idx}, must be in [0, {n_nodes-1}]"
+    assert isinstance(num_vehicles, int) and num_vehicles >= 1, f"Invalid num_vehicles: {num_vehicles}"
+    
+    if end_idx is None or end_idx == start_idx:
+        # Circular route: use 3-argument signature
+        logger.info(f"🔧 Creating circular RoutingIndexManager: N={n_nodes}, vehicles={num_vehicles}, start=end={start_idx}")
+        return pywrapcp.RoutingIndexManager(n_nodes, num_vehicles, start_idx)
+    else:
+        # Open route: use 4-argument signature with lists
+        assert isinstance(end_idx, int) and 0 <= end_idx < n_nodes, f"Invalid end_idx: {end_idx}, must be in [0, {n_nodes-1}]"
+        logger.info(f"🔧 Creating open RoutingIndexManager: N={n_nodes}, vehicles={num_vehicles}, start={start_idx}, end={end_idx}")
+        return pywrapcp.RoutingIndexManager(n_nodes, num_vehicles, [start_idx], [end_idx])
+
+
+def solve_tsp_from_matrix(
+    durations_s_matrix: List[List[float]],
+    start_idx: int = 0,
+    end_idx: int = None,
+    time_limit_sec: int = 5
+) -> List[int]:
+    """
+    Solve TSP from a duration matrix using OR-Tools.
+    
+    Args:
+        durations_s_matrix: NxN matrix of durations in seconds
+        start_idx: Starting node index (0-based)
+        end_idx: Ending node index (None for circular route)
+        time_limit_sec: Time limit for optimization
+    
+    Returns:
+        List of node indices representing the tour (0-based)
+    
+    Raises:
+        ValueError: If matrix is invalid or indices are out of range
+    """
+    if not ORTOOLS_AVAILABLE:
+        raise ImportError("OR-Tools not available. Install with: pip install ortools")
+    
+    # Validate matrix
+    n = len(durations_s_matrix)
+    if n < 2:
+        raise ValueError(f"Matrix too small: {n}x{n}, need at least 2x2")
+    
+    for i, row in enumerate(durations_s_matrix):
+        if len(row) != n:
+            raise ValueError(f"Matrix not square: row {i} has {len(row)} elements, expected {n}")
+        if any(x is None or np.isnan(x) for x in row):
+            raise ValueError(f"Matrix contains None/NaN values in row {i}")
+    
+    # Convert to integer matrix for OR-Tools
+    cost_matrix = [[int(round(durations_s_matrix[i][j])) for j in range(n)] for i in range(n)]
+    
+    logger.info(f"🎯 Solving TSP from matrix: N={n}, start_idx={start_idx}, end_idx={end_idx}")
+    
+    try:
+        # Create routing manager
+        manager = _create_routing_manager(n, 1, start_idx, end_idx)
+        routing = pywrapcp.RoutingModel(manager)
+        
+        # Register transit callback
+        def transit_callback(from_i, to_i):
+            from_node = manager.IndexToNode(from_i)
+            to_node = manager.IndexToNode(to_i)
+            return cost_matrix[from_node][to_node]
+        
+        transit_cb_index = routing.RegisterTransitCallback(transit_callback)
+        routing.SetArcCostEvaluatorOfAllVehicles(transit_cb_index)
+        
+        # Search parameters
+        search_params = pywrapcp.DefaultRoutingSearchParameters()
+        search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+        search_params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+        search_params.time_limit.FromSeconds(time_limit_sec)
+        # Note: random_seed may not be available in all OR-Tools versions
+        
+        # Solve
+        solution = routing.SolveWithParameters(search_params)
+        
+        if not solution:
+            raise RuntimeError("OR-Tools could not find solution")
+        
+        # Extract route
+        route = []
+        index = routing.Start(0)
+        
+        while not routing.IsEnd(index):
+            node = manager.IndexToNode(index)
+            route.append(node)
+            index = solution.Value(routing.NextVar(index))
+        
+        # Add final node if it's different from start (open route)
+        if end_idx is not None and end_idx != start_idx:
+            final_node = manager.IndexToNode(index)
+            route.append(final_node)
+        
+        logger.info(f"✅ TSP solved: route length={len(route)}, route={route}")
+        return route
+        
+    except Exception as e:
+        logger.error(f"TSP solving failed: {e}")
+        raise
+
+
 def solve_open_tsp_dummy(
     ids: List[int],
     coords: List[Tuple[float, float]],   # (lon, lat)
@@ -106,12 +223,12 @@ def solve_open_tsp_dummy(
     logger.info("🧮 Solving TSP with dummy node...")
     
     try:
-        # Create routing manager and model
-        manager = pywrapcp.RoutingIndexManager(
-            n_locs + 1,  # Include dummy node
-            1,           # Single vehicle
-            dummy_idx,   # Start at dummy
-            dummy_idx    # End at dummy
+        # Create routing manager and model using helper function
+        manager = _create_routing_manager(
+            n_nodes=n_locs + 1,
+            num_vehicles=1,
+            start_idx=dummy_idx,
+            end_idx=dummy_idx  # Same as start for circular route
         )
         
         routing = pywrapcp.RoutingModel(manager)
@@ -135,7 +252,7 @@ def solve_open_tsp_dummy(
         )
         search_parameters.time_limit.FromSeconds(time_limit_sec)
         search_parameters.log_search = False
-        search_parameters.random_seed = 42
+        # Note: random_seed may not be available in all OR-Tools versions
         
         # Solve
         solution = routing.SolveWithParameters(search_parameters)
@@ -250,13 +367,13 @@ def solve_open_tsp_complete(
     
     # === VALIDATIONS ===
     if not ids or not coords:
-        return _error_result("Empty inputs")
+        return _error_result("Empty inputs", cost_metric)
     
     if len(ids) > 200:
-        return _error_result(f"Too many locations: {len(ids)} > 200")
+        return _error_result(f"Too many locations: {len(ids)} > 200", cost_metric)
     
     if not MATRIX_AVAILABLE:
-        return _error_result("Matrix computation not available")
+        return _error_result("Matrix computation not available", cost_metric)
     
     # === COMPUTE COST MATRIX ===
     logger.info("📊 Computing cost matrix...")
@@ -267,7 +384,7 @@ def solve_open_tsp_complete(
         
     except Exception as e:
         logger.error(f"Matrix computation failed: {e}")
-        return _error_result(f"Matrix error: {e}")
+        return _error_result(f"Matrix error: {e}", cost_metric)
     
     # === SOLVE TSP ===
     tsp_result = solve_open_tsp_dummy(
@@ -281,6 +398,7 @@ def solve_open_tsp_complete(
     if tsp_result['success']:
         tsp_result['matrix_meta']['source'] = matrix_source
         tsp_result['matrix_meta']['profile'] = osrm_profile
+        tsp_result['cost_metric'] = cost_metric  # Add cost metric to result
         tsp_result['best_start_attempts'] = 1  # compatibility with UI
         
         # Add total computation time
@@ -291,6 +409,7 @@ def solve_open_tsp_complete(
     else:
         # Add compatibility fields even for failed results
         tsp_result['best_start_attempts'] = 1
+        tsp_result['cost_metric'] = cost_metric  # Add cost metric even for failed results
         if 'matrix_meta' not in tsp_result:
             tsp_result['matrix_meta'] = {}
         tsp_result['matrix_meta']['profile'] = osrm_profile
@@ -298,7 +417,7 @@ def solve_open_tsp_complete(
     return tsp_result
 
 
-def _error_result(error_msg: str) -> Dict:
+def _error_result(error_msg: str, cost_metric: str = "duration") -> Dict:
     """Create standard error result"""
     return {
         "order_ids": [],
@@ -306,6 +425,7 @@ def _error_result(error_msg: str) -> Dict:
         "start_id": None,
         "end_id": None,
         "total_cost": 0.0,
+        "cost_metric": cost_metric,
         "matrix_meta": {"n": 0, "source": "error"},
         "success": False,
         "error": error_msg,

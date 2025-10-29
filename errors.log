@@ -15,3 +15,13 @@
     operations_research::RoutingIndexManager::RoutingIndexManager(int,int,operations_research::RoutingIndexManager::NodeIndex)
     operations_research::RoutingIndexManager::RoutingIndexManager(int,int,std::vector< operations_research::RoutingIndexManager::NodeIndex > const &,std::vector< operations_research::RoutingIndexManager::NodeIndex > const &)
 
+2025-10-29 13:01:21,829 - ERROR - TSP solving failed: Wrong number or type of arguments for overloaded function 'new_RoutingIndexManager'.
+  Possible C/C++ prototypes are:
+    operations_research::RoutingIndexManager::RoutingIndexManager(int,int,operations_research::RoutingIndexManager::NodeIndex)
+    operations_research::RoutingIndexManager::RoutingIndexManager(int,int,std::vector< operations_research::RoutingIndexManager::NodeIndex > const &,std::vector< operations_research::RoutingIndexManager::NodeIndex > const &)
+
+2025-10-29 15:57:49,786 - ERROR - TSP solving failed: Wrong number or type of arguments for overloaded function 'new_RoutingIndexManager'.
+  Possible C/C++ prototypes are:
+    operations_research::RoutingIndexManager::RoutingIndexManager(int,int,operations_research::RoutingIndexManager::NodeIndex)
+    operations_research::RoutingIndexManager::RoutingIndexManager(int,int,std::vector< operations_research::RoutingIndexManager::NodeIndex > const &,std::vector< operations_research::RoutingIndexManager::NodeIndex > const &)
+

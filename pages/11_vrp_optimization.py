@@ -218,7 +218,9 @@ def display_tsp_results(tsp_result, locations_df):
         st.metric("📍 Clientes", len(tsp_result['order_ids']))
     
     with col3:
-        if tsp_result['cost_metric'] == 'duration':
+        # Handle missing cost_metric for backwards compatibility
+        cost_metric = tsp_result.get('cost_metric', 'duration')
+        if cost_metric == 'duration':
             value = f"{tsp_result['total_cost']:.0f}s"
             display_value = f"{tsp_result['total_cost']/60:.1f} min"
         else:
